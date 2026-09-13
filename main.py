@@ -27,8 +27,8 @@ os.makedirs(PDF_DIR, exist_ok=True)
 
 ROLES = ['Admin', 'Store Manager', 'Cashier', 'Accounts']
 PERMS = {
-    'Admin': {'dashboard','billing','inventory','customers','sales','reports','settings','users','sms','account'},
-    'Store Manager': {'dashboard','billing','inventory','customers','sales','reports','settings','users','sms','account'},
+    'Admin': {'dashboard','billing','inventory','customers','sales','reports','settings','users','sms','audit','account'},
+    'Store Manager': {'dashboard','billing','inventory','customers','sales','reports','settings','users','sms','audit','account'},
     'Cashier': {'dashboard','billing','customers','sms','account'},
     'Accounts': {'dashboard','customers','sales','reports','account'},
 }
@@ -53,7 +53,13 @@ def normalize_phone(p):
     return re.sub(r'\D', '', p or '')
 
 def parse_date(s):
-    return datetime.strptime(s.strip(), '%Y-%m-%d').date()
+    if isinstance(s, datetime): return s.date()
+    if isinstance(s, date): return s
+    text=str(s or '').strip()
+    for fmt in ('%Y-%m-%d','%d-%m-%Y','%d/%m/%Y','%Y/%m/%d','%d.%m.%Y','%m/%d/%Y'):
+        try: return datetime.strptime(text, fmt).date()
+        except ValueError: pass
+    raise ValueError('Invalid date. Use YYYY-MM-DD or DD-MM-YYYY.')
 
 def fmt_date(s):
     try: return parse_date(s).strftime('%d-%m-%Y')
@@ -96,34 +102,57 @@ class DB:
         c = self.conn.cursor()
         c.executescript('''
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL, verified INTEGER DEFAULT 1, active INTEGER DEFAULT 1, must_change INTEGER DEFAULT 0, created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT UNIQUE NOT NULL, email TEXT DEFAULT '', address TEXT DEFAULT '', credit REAL DEFAULT 0, total_purchase REAL DEFAULT 0, last_purchase TEXT);
-        CREATE TABLE IF NOT EXISTS medicines(id INTEGER PRIMARY KEY, name TEXT NOT NULL, batch TEXT DEFAULT '', expiry TEXT DEFAULT '', price REAL DEFAULT 0, mrp REAL DEFAULT 0, cost REAL DEFAULT 0, stock INTEGER DEFAULT 0, gst REAL DEFAULT 0, supplier TEXT DEFAULT '', manufacturer TEXT DEFAULT '', pack TEXT DEFAULT '', UNIQUE(name,batch));
+        CREATE TABLE IF NOT EXISTS customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT UNIQUE NOT NULL, email TEXT DEFAULT '', address TEXT DEFAULT '', credit REAL DEFAULT 0, total_purchase REAL DEFAULT 0, last_purchase TEXT, created_by TEXT DEFAULT '', updated_by TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS medicines(id INTEGER PRIMARY KEY, name TEXT NOT NULL, molecule TEXT DEFAULT '', batch TEXT DEFAULT '', expiry TEXT DEFAULT '', price REAL DEFAULT 0, mrp REAL DEFAULT 0, cost REAL DEFAULT 0, stock INTEGER DEFAULT 0, gst REAL DEFAULT 0, supplier TEXT DEFAULT '', manufacturer TEXT DEFAULT '', pack TEXT DEFAULT '', created_by TEXT DEFAULT '', updated_by TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS bills(id INTEGER PRIMARY KEY, invoice TEXT UNIQUE NOT NULL, bill_date TEXT NOT NULL, bill_time TEXT NOT NULL, customer_id INTEGER, customer_name TEXT, customer_phone TEXT, customer_address TEXT DEFAULT '', doctor_name TEXT DEFAULT '', doctor_reg TEXT DEFAULT '', payment TEXT, subtotal REAL, gst REAL, total REAL, discount REAL DEFAULT 0, round_off REAL DEFAULT 0, sms_status TEXT DEFAULT 'Not sent', created_by TEXT, FOREIGN KEY(customer_id) REFERENCES customers(id));
-        CREATE TABLE IF NOT EXISTS bill_items(id INTEGER PRIMARY KEY, bill_id INTEGER NOT NULL, medicine_id INTEGER, name TEXT, batch TEXT, expiry TEXT DEFAULT '', mrp REAL DEFAULT 0, manufacturer TEXT DEFAULT '', pack TEXT DEFAULT '', qty INTEGER, price REAL, gst REAL, discount REAL DEFAULT 0, amount REAL, FOREIGN KEY(bill_id) REFERENCES bills(id) ON DELETE CASCADE);
-        CREATE TABLE IF NOT EXISTS sms_outbox(id INTEGER PRIMARY KEY, bill_id INTEGER, phone TEXT, message TEXT, status TEXT, provider_response TEXT DEFAULT '', created_at TEXT, FOREIGN KEY(bill_id) REFERENCES bills(id));
+        CREATE TABLE IF NOT EXISTS bill_items(id INTEGER PRIMARY KEY, bill_id INTEGER NOT NULL, medicine_id INTEGER, name TEXT, molecule TEXT DEFAULT '', batch TEXT, expiry TEXT DEFAULT '', mrp REAL DEFAULT 0, manufacturer TEXT DEFAULT '', pack TEXT DEFAULT '', qty INTEGER, price REAL, gst REAL, discount REAL DEFAULT 0, amount REAL, FOREIGN KEY(bill_id) REFERENCES bills(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS sms_outbox(id INTEGER PRIMARY KEY, bill_id INTEGER, phone TEXT, message TEXT, status TEXT, provider_response TEXT DEFAULT '', created_at TEXT, created_by TEXT DEFAULT '', FOREIGN KEY(bill_id) REFERENCES bills(id));
+        CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT DEFAULT '', action TEXT NOT NULL, details TEXT DEFAULT '', performed_by TEXT NOT NULL, performed_at TEXT NOT NULL);
         ''')
         # Migrate older databases created before the credential-change feature.
         cols={r['name'] for r in c.execute('PRAGMA table_info(users)').fetchall()}
         if 'must_change' not in cols:
             c.execute('ALTER TABLE users ADD COLUMN must_change INTEGER DEFAULT 0')
         mcols={r['name'] for r in c.execute('PRAGMA table_info(medicines)').fetchall()}
+        for col,typ in [('created_by',"TEXT DEFAULT ''"),('updated_by',"TEXT DEFAULT ''")]:
+            if col not in mcols: c.execute(f'ALTER TABLE medicines ADD COLUMN {col} {typ}')
+        ccols={r['name'] for r in c.execute('PRAGMA table_info(customers)').fetchall()}
+        for col,typ in [('created_by',"TEXT DEFAULT ''"),('updated_by',"TEXT DEFAULT ''")]:
+            if col not in ccols: c.execute(f'ALTER TABLE customers ADD COLUMN {col} {typ}')
+        scols={r['name'] for r in c.execute('PRAGMA table_info(sms_outbox)').fetchall()}
+        if 'created_by' not in scols: c.execute("ALTER TABLE sms_outbox ADD COLUMN created_by TEXT DEFAULT ''")
+        # Migrate older medicine tables and remove the old UNIQUE(name,batch)
+        # rule: supplier and molecule now determine whether an entry is distinct.
+        if 'molecule' not in mcols:
+            c.execute("ALTER TABLE medicines ADD COLUMN molecule TEXT DEFAULT ''")
         for col,typ in [('mrp','REAL DEFAULT 0'),('manufacturer',"TEXT DEFAULT ''"),('pack',"TEXT DEFAULT ''")]:
             if col not in mcols: c.execute(f'ALTER TABLE medicines ADD COLUMN {col} {typ}')
+        idx_rows=c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='medicines'").fetchone()
+        table_sql=(idx_rows['sql'] or '') if idx_rows else ''
+        if 'UNIQUE(name,batch)' in table_sql or 'UNIQUE(name, batch)' in table_sql:
+            c.execute('PRAGMA foreign_keys=OFF')
+            c.execute("CREATE TABLE IF NOT EXISTS medicines_new(id INTEGER PRIMARY KEY, name TEXT NOT NULL, molecule TEXT DEFAULT '', batch TEXT DEFAULT '', expiry TEXT DEFAULT '', price REAL DEFAULT 0, mrp REAL DEFAULT 0, cost REAL DEFAULT 0, stock INTEGER DEFAULT 0, gst REAL DEFAULT 0, supplier TEXT DEFAULT '', manufacturer TEXT DEFAULT '', pack TEXT DEFAULT '', created_by TEXT DEFAULT '', updated_by TEXT DEFAULT '')")
+            c.execute("INSERT INTO medicines_new SELECT id,name,molecule,batch,expiry,price,mrp,cost,stock,gst,supplier,manufacturer,pack,created_by,updated_by FROM medicines")
+            c.execute('DROP TABLE medicines')
+            c.execute('ALTER TABLE medicines_new RENAME TO medicines')
+            c.execute('PRAGMA foreign_keys=ON')
         bcols={r['name'] for r in c.execute('PRAGMA table_info(bills)').fetchall()}
         for col,typ in [('customer_address',"TEXT DEFAULT ''"),('doctor_name',"TEXT DEFAULT ''"),('doctor_reg',"TEXT DEFAULT ''"),('discount','REAL DEFAULT 0'),('round_off','REAL DEFAULT 0')]:
             if col not in bcols: c.execute(f'ALTER TABLE bills ADD COLUMN {col} {typ}')
         icols={r['name'] for r in c.execute('PRAGMA table_info(bill_items)').fetchall()}
-        for col,typ in [('expiry',"TEXT DEFAULT ''"),('mrp','REAL DEFAULT 0'),('manufacturer',"TEXT DEFAULT ''"),('pack',"TEXT DEFAULT ''"),('discount','REAL DEFAULT 0')]:
+        for col,typ in [('molecule',"TEXT DEFAULT ''"),('expiry',"TEXT DEFAULT ''"),('mrp','REAL DEFAULT 0'),('manufacturer',"TEXT DEFAULT ''"),('pack',"TEXT DEFAULT ''"),('discount','REAL DEFAULT 0')]:
             if col not in icols: c.execute(f'ALTER TABLE bill_items ADD COLUMN {col} {typ}')
         if not c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
             for name,email,pw,role in [('Administrator','admin@medibillwb.in','Admin@1234','Admin'),('Store Manager','store@medibillwb.in','Demo@1234','Store Manager'),('Cashier','cashier@medibillwb.in','Demo@1234','Cashier'),('Accounts','accounts@medibillwb.in','Demo@1234','Accounts')]:
                 salt,d=hash_pw(pw); c.execute('INSERT INTO users(name,email,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(name,email,salt,d,role,1,1,1 if email=='admin@medibillwb.in' else 0,datetime.now().isoformat(timespec='seconds')))
         if not c.execute('SELECT 1 FROM medicines LIMIT 1').fetchone():
-            meds=[('Paracetamol 500mg','PCT001','2027-08-31',25,25,12,80,5,'Demo Supplier','Demo Pharma','10 tablets'),('Azithromycin 500mg','AZI001','2027-03-31',85,85,48,25,5,'Demo Supplier','Demo Pharma','6 tablets'),('ORS Lemon','ORS001','2028-01-31',22,22,13,50,5,'Demo Supplier','Demo Pharma','21 g'),('Pantoprazole 40mg','PAN001','2027-11-30',60,60,30,35,12,'Demo Supplier','Demo Pharma','10 tablets'),('Vitamin C 500mg','VIT001','2026-11-30',35,35,20,7,12,'Demo Supplier','Demo Pharma','10 tablets'),('Cetirizine 10mg','CET001','2026-10-15',18,18,9,15,5,'Demo Supplier','Demo Pharma','10 tablets')]
-            c.executemany('INSERT INTO medicines(name,batch,expiry,price,mrp,cost,stock,gst,supplier,manufacturer,pack) VALUES(?,?,?,?,?,?,?,?,?,?,?)',meds)
+            meds=[('Paracetamol 500mg','Paracetamol','PCT001','2027-08-31',25,25,12,80,5,'Demo Supplier','Demo Pharma','10 tablets'),('Azithromycin 500mg','Azithromycin','AZI001','2027-03-31',85,85,48,25,5,'Demo Supplier','Demo Pharma','6 tablets'),('ORS Lemon','Oral Rehydration Salts','ORS001','2028-01-31',22,22,13,50,5,'Demo Supplier','Demo Pharma','21 g'),('Pantoprazole 40mg','Pantoprazole','PAN001','2027-11-30',60,60,30,35,12,'Demo Supplier','Demo Pharma','10 tablets'),('Vitamin C 500mg','Ascorbic Acid','VIT001','2026-11-30',35,35,20,7,12,'Demo Supplier','Demo Pharma','10 tablets'),('Cetirizine 10mg','Cetirizine','CET001','2026-10-15',18,18,9,15,5,'Demo Supplier','Demo Pharma','10 tablets')]
+            c.executemany('INSERT INTO medicines(name,molecule,batch,expiry,price,mrp,cost,stock,gst,supplier,manufacturer,pack) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',meds)
         self.conn.commit()
     def q(self,sql,args=()): return self.conn.execute(sql,args).fetchall()
     def one(self,sql,args=()): return self.conn.execute(sql,args).fetchone()
+    def audit(self, entity_type, entity_id, action, details, performed_by):
+        self.conn.execute('INSERT INTO audit_log(entity_type,entity_id,action,details,performed_by,performed_at) VALUES(?,?,?,?,?,?)',(entity_type,str(entity_id or ''),action,details or '',performed_by,datetime.now().isoformat(timespec='seconds')))
     def close(self): self.conn.close()
 
 class SMS:
@@ -251,6 +280,7 @@ class App:
             row=self.db.one('SELECT * FROM users WHERE lower(email)=? AND active=1',(email.get().strip().lower(),))
             if not row or not verify_pw(pw.get(),row['salt'],row['password_hash']): messagebox.showerror('Login failed','Invalid email or password.'); return
             self.user=dict(row)
+            self.db.audit('Login', self.user['id'], 'Login', 'Successful login', self.user['email']); self.db.conn.commit()
             self.dashboard()
             if int(self.user.get('must_change',0)):
                 self.after_login_change_credentials()
@@ -269,7 +299,7 @@ class App:
             if not strong_pw(p1): messagebox.showerror('Validation','Password needs 8+ chars with upper, lower, number and special character.',parent=win); return
             if p1!=p2: messagebox.showerror('Validation','Passwords do not match.',parent=win); return
             if self.db.one('SELECT 1 FROM users WHERE lower(email)=?',(email.lower(),)): messagebox.showerror('Validation','This email already has an account.',parent=win); return
-            salt,d=hash_pw(p1); self.db.conn.execute('INSERT INTO users(name,email,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(name,email,salt,d,'Cashier',1,1,0,datetime.now().isoformat(timespec='seconds'))); self.db.conn.commit(); win.destroy(); messagebox.showinfo('Created','Account created. A Store Manager/Admin can assign its role.')
+            salt,d=hash_pw(p1); cur=self.db.conn.execute('INSERT INTO users(name,email,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(name,email,salt,d,'Cashier',1,1,0,datetime.now().isoformat(timespec='seconds'))); self.db.audit('User',cur.lastrowid,'Created',f'Worker account {email} created',self.user['email'] if self.user else email); self.db.conn.commit(); win.destroy(); messagebox.showinfo('Created','Account created. A Store Manager/Admin can assign its role.')
         self.button(frm,'Create Account',save,kind='success').grid(row=9,column=0,columnspan=2,pady=8)
     def title(self,title,subtitle=''):
         for w in self.content.winfo_children(): w.destroy()
@@ -289,7 +319,7 @@ class App:
         self.content_canvas.bind('<MouseWheel>',lambda e:self.content_canvas.yview_scroll(int(-e.delta/120),'units'))
         self.content.bind('<MouseWheel>',lambda e:self.content_canvas.yview_scroll(int(-e.delta/120),'units'))
         tk.Label(side,text='MediBill',bg='#0f172a',fg='white',font=('Segoe UI',21,'bold')).pack(anchor='w',padx=20,pady=(25,2)); tk.Label(side,text=self.company,bg='#0f172a',fg='#94a3b8',font=('Segoe UI',9),wraplength=180).pack(anchor='w',padx=20,pady=(0,15)); tk.Label(side,text=f"{self.user['name']}\n{self.user['role']}",bg='#1e293b',fg='#e2e8f0',justify='left',anchor='w',padx=12,pady=10).pack(fill='x',padx=12,pady=(0,15))
-        items=[('Dashboard','dashboard_home'),('Billing','billing'),('Inventory','inventory'),('Customers','customers'),('Sales','sales'),('Reports','reports'),('SMS Outbox','sms_outbox'),('Settings','settings'),('Users & Roles','users'),('My Account','account')]
+        items=[('Dashboard','dashboard_home'),('Billing','billing'),('Inventory','inventory'),('Customers','customers'),('Sales','sales'),('Reports','reports'),('SMS Outbox','sms_outbox'),('Settings','settings'),('Users & Roles','users'),('Audit Log','audit'),('My Account','account')]
         for label,method in items:
             perm='dashboard' if method=='dashboard_home' else method
             if perm not in PERMS.get(self.user['role'],set()): continue
@@ -324,7 +354,7 @@ class App:
         tk.Label(self.content,text='Medicine Status',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',16,'bold')).pack(anchor='w',pady=(18,8))
         table=tk.Frame(self.content,bg='white'); table.pack(fill='both',expand=True)
         tv=ttk.Treeview(table,columns=('name','batch','stock','expiry','status'),show='headings');tv.pack(side='left',fill='both',expand=True)
-        sb=ttk.Scrollbar(table,orient='vertical',command=tv.yview);sb.pack(side='right',fill='y');tv.configure(yscrollcommand=sb.set)
+        sb=ttk.Scrollbar(table,orient='vertical',command=tv.yview);sb.pack(side='right',fill='y'); dash_hsb=ttk.Scrollbar(self.content,orient='horizontal',command=tv.xview);dash_hsb.pack(fill='x');tv.configure(yscrollcommand=sb.set,xscrollcommand=dash_hsb.set)
         for c,h in [('name','Medicine'),('batch','Batch'),('stock','Stock'),('expiry','Expiry'),('status','Status')]: tv.heading(c,text=h)
         tv.column('name',width=280,minwidth=150,stretch=True);tv.column('batch',width=120,minwidth=90,stretch=True);tv.column('stock',width=90,minwidth=70,stretch=False);tv.column('expiry',width=120,minwidth=100,stretch=False);tv.column('status',width=130,minwidth=110,stretch=False)
         tv.tag_configure('near',foreground='#dc2626');tv.tag_configure('expired',foreground='#991b1b');tv.tag_configure('low',foreground='#d97706');tv.tag_configure('instock',foreground='#15803d')
@@ -357,15 +387,15 @@ class App:
         tk.Label(info,text='Payment method',bg='white',fg='#475569').grid(row=0,column=4,sticky='w',padx=5); ttk.Combobox(info,textvariable=self.b_payment,values=['Cash','UPI','Card','Credit'],state='readonly',width=14).grid(row=1,column=4,padx=5,sticky='w')
         tk.Label(self.content,text='Find medicine',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',13,'bold')).pack(anchor='w',pady=(18,6)); sf=tk.Frame(self.content,bg='#f8fafc'); sf.pack(fill='x'); search=tk.Entry(sf,textvariable=self.b_search,font=('Segoe UI',11),bd=1,relief='solid'); search.pack(side='left',fill='x',expand=True,ipady=7); tk.Label(sf,text='  Type to search instantly',bg='#f8fafc',fg='#64748b').pack(side='left')
         results_box=tk.Frame(self.content,bg='#f8fafc'); results_box.pack(fill='x',pady=8)
-        self.bill_results=ttk.Treeview(results_box,columns=('id','name','batch','expiry','mrp','price','stock'),show='headings',height=5); self.bill_results.pack(side='left',fill='both',expand=True)
-        rsb=ttk.Scrollbar(results_box,orient='vertical',command=self.bill_results.yview); rsb.pack(side='right',fill='y'); self.bill_results.configure(yscrollcommand=rsb.set)
-        for c,h in [('id','ID'),('name','Medicine'),('batch','Batch'),('expiry','Expiry'),('mrp','MRP'),('price','Selling Price'),('stock','Available')]: self.bill_results.heading(c,text=h)
+        self.bill_results=ttk.Treeview(results_box,columns=('id','name','molecule','batch','expiry','mrp','price','stock'),show='headings',height=5); self.bill_results.pack(side='left',fill='both',expand=True)
+        rsb=ttk.Scrollbar(results_box,orient='vertical',command=self.bill_results.yview); rsb.pack(side='right',fill='y'); r_hsb=ttk.Scrollbar(self.content,orient='horizontal',command=self.bill_results.xview); r_hsb.pack(fill='x'); self.bill_results.configure(yscrollcommand=rsb.set,xscrollcommand=r_hsb.set)
+        for c,h in [('id','ID'),('name','Medicine'),('molecule','Molecule'),('batch','Batch'),('expiry','Expiry'),('mrp','MRP'),('price','Selling Price'),('stock','Available')]: self.bill_results.heading(c,text=h)
         self.bill_results.bind('<Double-1>',lambda e:self.add_selected()); self.bill_results.bind('<Return>',lambda e:self.add_selected()); self.bill_search()
         tk.Label(self.content,text='Bill items',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',13,'bold')).pack(anchor='w',pady=(10,6))
         cartbox=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0'); cartbox.pack(fill='x',expand=False)
         cart_table=tk.Frame(cartbox,bg='white'); cart_table.pack(fill='x',expand=False)
         self.cart_tv=ttk.Treeview(cart_table,columns=('name','batch','qty','mrp','price','gst','discount','amount'),show='headings',height=5); self.cart_tv.pack(side='left',fill='both',expand=True)
-        cart_sb=ttk.Scrollbar(cart_table,orient='vertical',command=self.cart_tv.yview); cart_sb.pack(side='right',fill='y'); self.cart_tv.configure(yscrollcommand=cart_sb.set)
+        cart_sb=ttk.Scrollbar(cart_table,orient='vertical',command=self.cart_tv.yview); cart_sb.pack(side='right',fill='y'); cart_hsb=ttk.Scrollbar(cartbox,orient='horizontal',command=self.cart_tv.xview); cart_hsb.pack(side='bottom',fill='x'); self.cart_tv.configure(yscrollcommand=cart_sb.set,xscrollcommand=cart_hsb.set)
         
         for c,h in [('name','Medicine'),('batch','Batch'),('qty','Quantity'),('mrp','MRP'),('price','Selling Price'),('gst','GST %'),('discount','Disc.'),('amount','Amount')]: self.cart_tv.heading(c,text=h)
         self.cart_tv.bind('<Double-1>',lambda e:self.edit_cart_qty()); self.cart_tv.bind('<Delete>',lambda e:self.remove_cart())
@@ -394,7 +424,7 @@ class App:
                 if it['qty']<r['stock']:it['qty']+=1
                 else:messagebox.showwarning('Stock','Maximum available quantity reached.')
                 self.refresh_cart();return
-        self.cart.append({'id':r['id'],'name':r['name'],'batch':r['batch'],'expiry':r['expiry'],'mrp':float(r['mrp'] or r['price']),'manufacturer':r['manufacturer'],'pack':r['pack'],'qty':1,'price':float(r['price']),'gst':float(r['gst']),'discount':0.0});self.refresh_cart()
+        self.cart.append({'id':r['id'],'name':r['name'],'molecule':r['molecule'],'batch':r['batch'],'expiry':r['expiry'],'mrp':float(r['mrp'] or r['price']),'manufacturer':r['manufacturer'],'pack':r['pack'],'qty':1,'price':float(r['price']),'gst':float(r['gst']),'discount':0.0});self.refresh_cart()
     def selected_cart_index(self):
         s=self.cart_tv.selection(); return int(s[0]) if s and s[0].isdigit() else None
     def change_qty(self,delta):
@@ -429,17 +459,18 @@ class App:
             cur=self.db.conn.cursor();cur.execute('BEGIN');cid=None
             if phone:
                 old=cur.execute('SELECT id FROM customers WHERE phone=?',(phone,)).fetchone()
-                if old:cid=old['id'];cur.execute('UPDATE customers SET name=?,last_purchase=? WHERE id=?',(name,now.isoformat(timespec='seconds'),cid))
-                else:cur.execute('INSERT INTO customers(name,phone,last_purchase) VALUES(?,?,?)',(name,phone,now.isoformat(timespec='seconds')));cid=cur.lastrowid
+                if old:cid=old['id'];cur.execute('UPDATE customers SET name=?,last_purchase=?,updated_by=? WHERE id=?',(name,now.isoformat(timespec='seconds'),self.user['email'],cid))
+                else:cur.execute('INSERT INTO customers(name,phone,last_purchase,created_by,updated_by) VALUES(?,?,?,?,?)',(name,phone,now.isoformat(timespec='seconds'),self.user['email'],self.user['email']));cid=cur.lastrowid
             for it in self.cart:
                 stock=cur.execute('SELECT stock FROM medicines WHERE id=?',(it['id'],)).fetchone()['stock']
                 if stock<it['qty']:raise ValueError(f'Insufficient stock for {it["name"]}')
                 base=Decimal(str(it['qty']*it['price']));tax=(base*Decimal(str(it['gst']))/Decimal('100')).quantize(Decimal('0.01'));subtotal+=float(base);gsttotal+=float(tax);total+=float(base+tax)
-            cur.execute('INSERT INTO bills(invoice,bill_date,bill_time,customer_id,customer_name,customer_phone,customer_address,doctor_name,doctor_reg,payment,subtotal,gst,total,discount,round_off,sms_status,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(invoice,now.strftime('%Y-%m-%d'),now.strftime('%H:%M:%S'),cid,name,phone,self.b_address.get().strip(),self.b_doctor.get().strip(),self.b_doctor_reg.get().strip(),self.b_payment.get(),money(subtotal),money(gsttotal),money(total),0,0,'Not sent' if phone else 'No mobile',self.user['email']));bid=cur.lastrowid
+            cur.execute('INSERT INTO bills(invoice,bill_date,bill_time,customer_id,customer_name,customer_phone,customer_address,doctor_name,doctor_reg,payment,subtotal,gst,total,discount,round_off,sms_status,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(invoice,now.strftime('%Y-%m-%d'),now.strftime('%H:%M:%S'),cid,name,phone,self.b_address.get().strip(),self.b_doctor.get().strip(),self.b_doctor_reg.get().strip(),self.b_payment.get(),money(subtotal),money(gsttotal),money(total),0,0,'Not sent' if phone else 'No mobile',self.user['email']));bid=cur.lastrowid
             for it in self.cart:
-                base=money(it['qty']*it['price']);tax=money(base*it['gst']/100);cur.execute('INSERT INTO bill_items(bill_id,medicine_id,name,batch,expiry,mrp,manufacturer,pack,qty,price,gst,discount,amount) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(bid,it['id'],it['name'],it['batch'],it.get('expiry',''),it.get('mrp',it['price']),it.get('manufacturer',''),it.get('pack',''),it['qty'],it['price'],it['gst'],it.get('discount',0),money(base+tax)));cur.execute('UPDATE medicines SET stock=stock-? WHERE id=?',(it['qty'],it['id']))
+                base=money(it['qty']*it['price']);tax=money(base*it['gst']/100);cur.execute('INSERT INTO bill_items(bill_id,medicine_id,name,molecule,batch,expiry,mrp,manufacturer,pack,qty,price,gst,discount,amount) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(bid,it['id'],it['name'],it.get('molecule',''),it['batch'],it.get('expiry',''),it.get('mrp',it['price']),it.get('manufacturer',''),it.get('pack',''),it['qty'],it['price'],it['gst'],it.get('discount',0),money(base+tax)));cur.execute('UPDATE medicines SET stock=stock-? WHERE id=?',(it['qty'],it['id']))
             if cid:cur.execute('UPDATE customers SET total_purchase=total_purchase+? WHERE id=?',(money(total),cid))
-            if phone:cur.execute('INSERT INTO sms_outbox(bill_id,phone,message,status,created_at) VALUES(?,?,?,?,?)',(bid,phone,self.sms_message(invoice,name,total),'Queued',now.isoformat(timespec='seconds')))
+            if phone:cur.execute('INSERT INTO sms_outbox(bill_id,phone,message,status,created_at,created_by) VALUES(?,?,?,?,?,?)',(bid,phone,self.sms_message(invoice,name,total),'Queued',now.isoformat(timespec='seconds'),self.user['email']))
+            self.db.audit('Bill',bid,'Created',f'Invoice {invoice}; total ₹{total:.2f}',self.user['email'])
             self.db.conn.commit()
         except Exception as e:self.db.conn.rollback();messagebox.showerror('Could not generate bill',str(e));return
         self.last_invoice=invoice;self.last_bill_id=bid;self.last_bill={'invoice':invoice,'date':now.strftime('%Y-%m-%d'),'time':now.strftime('%H:%M:%S'),'name':name,'phone':phone,'address':self.b_address.get().strip(),'doctor':self.b_doctor.get().strip(),'doctor_reg':self.b_doctor_reg.get().strip(),'payment':self.b_payment.get(),'subtotal':money(subtotal),'gst':money(gsttotal),'total':money(total),'items':[dict(x) for x in self.cart]}
@@ -499,67 +530,128 @@ class App:
         except Exception:pass
     def inventory(self):
         self.title('Inventory','Add medicines manually or import many medicines at once from Excel / CSV.')
-        top=tk.Frame(self.content,bg='#f8fafc');top.pack(fill='x',pady=(0,10));self.button(top,'Bulk Import Excel / CSV',self.bulk_import,kind='primary').pack(side='left');tk.Label(top,text='Expected columns: Name, Batch, Expiry, MRP, Selling Price, Cost, Stock, GST %, Supplier, Manufacturer, Pack',bg='#f8fafc',fg='#64748b').pack(side='left',padx=12)
-        form=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0',padx=12,pady=10);form.pack(fill='x');vars=[tk.StringVar() for _ in range(11)];labels=['Name','Batch','Expiry','MRP','Selling price','Cost','Stock','GST %','Supplier','Manufacturer','Pack']
+        top=tk.Frame(self.content,bg='#f8fafc');top.pack(fill='x',pady=(0,10));self.button(top,'Bulk Import Excel / CSV',self.bulk_import,kind='primary').pack(side='left');tk.Label(top,text='Expected columns: Name, Molecule, Batch, Expiry, MRP, Selling Price, Cost, Stock, GST %, Supplier, Manufacturer, Pack',bg='#f8fafc',fg='#64748b').pack(side='left',padx=12)
+        form=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0',padx=12,pady=10);form.pack(fill='x');vars=[tk.StringVar() for _ in range(12)];labels=['Name','Molecule','Batch','Expiry','MRP','Selling price','Cost','Stock','GST %','Supplier','Manufacturer','Pack']
         for i,(lab,var) in enumerate(zip(labels,vars)):
             col=i%4;row=(i//4)*2;tk.Label(form,text=lab,bg='white',fg='#475569').grid(row=row,column=col,sticky='w',padx=5,pady=(0,3));cell=tk.Frame(form,bg='white');cell.grid(row=row+1,column=col,sticky='w',padx=5,pady=(0,5));
             if lab=='Expiry':self.date_entry(cell,var,15)
             else:tk.Entry(cell,textvariable=var,width=20,bd=1,relief='solid').pack(ipady=5)
         def add():
             try:
-                name,batch,expiry,mrp,sprice,cost,stock,gst,supplier,manufacturer,pack=[v.get().strip() for v in vars]
-                parse_date(expiry);vals=(name,batch,expiry,float(sprice or 0),float(mrp or sprice or 0),float(cost or 0),int(stock or 0),float(gst or 0),supplier,manufacturer,pack)
-                self.db.conn.execute('INSERT INTO medicines(name,batch,expiry,price,mrp,cost,stock,gst,supplier,manufacturer,pack) VALUES(?,?,?,?,?,?,?,?,?,?,?)',vals);self.db.conn.commit();refresh();[v.set('') for v in vars]
+                name,molecule,batch,expiry,mrp,sprice,cost,stock,gst,supplier,manufacturer,pack=[v.get().strip() for v in vars]
+                parse_date(expiry);vals=(name,molecule,batch,expiry,float(sprice or 0),float(mrp or sprice or 0),float(cost or 0),int(stock or 0),float(gst or 0),supplier,manufacturer,pack)
+                existing=self.db.one('SELECT * FROM medicines WHERE lower(trim(name))=? AND lower(trim(COALESCE(molecule,'')))=lower(trim(?)) AND lower(trim(COALESCE(supplier,'')))=lower(trim(?)) ORDER BY id LIMIT 1',(name,molecule,supplier))
+                if existing:
+                    self.db.conn.execute('UPDATE medicines SET stock=stock+?,batch=?,expiry=?,price=?,mrp=?,cost=?,gst=?,manufacturer=?,pack=?,updated_by=? WHERE id=?',(vals[7],vals[2],vals[3],vals[4],vals[5],vals[6],vals[8],vals[10],vals[11],self.user['email'],existing['id']))
+                    self.db.audit('Medicine',existing['id'],'Updated',f'{name}: stock increased by {vals[7]}',self.user['email'])
+                else:
+                    cur=self.db.conn.execute('INSERT INTO medicines(name,molecule,batch,expiry,price,mrp,cost,stock,gst,supplier,manufacturer,pack,created_by,updated_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',vals+(self.user['email'],self.user['email']))
+                    self.db.audit('Medicine',cur.lastrowid,'Created',f'{name}; supplier {supplier}; stock {vals[7]}',self.user['email'])
+                self.db.conn.commit();refresh();[v.set('') for v in vars]
             except Exception as e:messagebox.showerror('Inventory','Please check the medicine fields.\n\n'+str(e))
         self.button(form,'Add Medicine',add,kind='success').grid(row=4,column=0,padx=5,pady=5,sticky='w')
         tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True,pady=10)
-        tv=ttk.Treeview(tvbox,columns=('id','name','batch','expiry','price','stock','gst','supplier'),show='headings');tv.pack(side='left',fill='both',expand=True)
-        tvsb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);tvsb.pack(side='right',fill='y');tv.configure(yscrollcommand=tvsb.set)
-        for c,h in [('id','ID'),('name','Medicine'),('batch','Batch'),('expiry','Expiry'),('price','Selling Price'),('stock','Stock'),('gst','GST %'),('supplier','Supplier')]:tv.heading(c,text=h)
+        tv=ttk.Treeview(tvbox,columns=('id','name','molecule','batch','expiry','price','stock','gst','supplier','saved_by'),show='headings');tv.pack(side='left',fill='both',expand=True)
+        tvsb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);tvsb.pack(side='right',fill='y'); inv_hsb=ttk.Scrollbar(self.content,orient='horizontal',command=tv.xview);inv_hsb.pack(fill='x');tv.configure(yscrollcommand=tvsb.set,xscrollcommand=inv_hsb.set)
+        for c,h in [('id','ID'),('name','Medicine'),('molecule','Molecule'),('batch','Batch'),('expiry','Expiry'),('price','Selling Price'),('stock','Stock'),('gst','GST %'),('supplier','Supplier'),('saved_by','Saved / Updated By')]:tv.heading(c,text=h)
         def refresh():
             for x in tv.get_children():tv.delete(x)
-            for r in self.db.q('SELECT id,name,batch,expiry,price,stock,gst,supplier FROM medicines ORDER BY name'):tv.insert('', 'end',values=(r['id'],r['name'],r['batch'],fmt_date(r['expiry']),f"₹{r['price']:.2f}",r['stock'],r['gst'],r['supplier']))
+            for r in self.db.q("SELECT id,name,molecule,batch,expiry,price,stock,gst,supplier,COALESCE(NULLIF(updated_by,''),created_by,'') AS saved_by FROM medicines ORDER BY name"):tv.insert('', 'end',values=(r['id'],r['name'],r['molecule'],r['batch'],fmt_date(r['expiry']),f"₹{r['price']:.2f}",r['stock'],r['gst'],r['supplier'],r['saved_by']))
         refresh()
     def bulk_import(self):
-        path=filedialog.askopenfilename(filetypes=[('Excel files','*.xlsx'),('CSV files','*.csv')]);
+        path=filedialog.askopenfilename(filetypes=[('Excel files','*.xlsx'),('CSV files','*.csv')])
         if not path:return
         records=[]
         try:
             if path.lower().endswith('.csv'):
-                with open(path,'r',encoding='utf-8-sig',newline='') as f:records=list(csv.DictReader(f))
+                with open(path,'r',encoding='utf-8-sig',newline='') as f:
+                    records=list(csv.DictReader(f))
             else:
-                if load_workbook is None:raise RuntimeError('Excel support is unavailable in this source build.')
-                ws=load_workbook(path,data_only=True).active;rows=list(ws.iter_rows(values_only=True));headers=[str(x or '').strip() for x in rows[0]];records=[dict(zip(headers,r)) for r in rows[1:] if any(x is not None for x in r)]
-            aliases={'name':['name','medicine','medicine name'],'batch':['batch','batch no'],'expiry':['expiry','expiry date'],'mrp':['mrp','maximum retail price'],'price':['selling price','price'],'cost':['cost','purchase price'],'stock':['stock','quantity','qty'],'gst':['gst','gst %','gst percent'],'supplier':['supplier','supplier name'],'manufacturer':['manufacturer','mfg','company'],'pack':['pack','packing','pack size']}
-            inserted=updated=errors=0
+                if load_workbook is None:
+                    raise RuntimeError('Excel support is unavailable in this source build.')
+                ws=load_workbook(path,data_only=True).active
+                rows=list(ws.iter_rows(values_only=True))
+                if not rows: raise ValueError('The Excel file is empty.')
+                headers=[str(x or '').strip() for x in rows[0]]
+                records=[dict(zip(headers,r)) for r in rows[1:] if any(x is not None and str(x).strip() for x in r)]
+
+            aliases={
+                'name':['name','medicine','medicine name','medicine_name','product','product name'],
+                'molecule':['molecule','active ingredient','active molecule','generic name','generic'],
+                'batch':['batch','batch no','batch number','batch_no'],
+                'expiry':['expiry','expiry date','expiry_date','exp','exp date'],
+                'mrp':['mrp','maximum retail price','mrp price','mrp_price'],
+                'price':['selling price','selling_price','sale price','sale_price','price'],
+                'cost':['cost','purchase price','purchase_price','buying price','buying_price'],
+                'stock':['stock','quantity','qty','opening stock','opening_stock'],
+                'gst':['gst','gst %','gst percent','gst percentage','tax','tax %'],
+                'supplier':['supplier','supplier name','supplier_name','vendor','vendor name'],
+                'manufacturer':['manufacturer','mfg','mfg name','company','manufacturer name'],
+                'pack':['pack','packing','pack size','pack_size','unit','package']
+            }
+            def normkey(v): return re.sub(r'[^a-z0-9]+',' ',str(v or '').strip().lower()).strip()
+            alias_map={k:{normkey(x) for x in vals} for k,vals in aliases.items()}
             def get(rec,key):
-                for k in aliases[key]:
-                    for actual in rec:
-                        if str(actual).strip().lower()==k:return rec[actual]
+                for actual,val in rec.items():
+                    if normkey(actual) in alias_map[key]: return val
                 return ''
-            for rec in records:
+            def num(v, default=0):
+                if v is None or str(v).strip()=='': return default
+                return float(str(v).replace('₹','').replace(',','').strip())
+            def text(v):
+                if v is None:return ''
+                if isinstance(v,float) and v.is_integer(): return str(int(v))
+                return str(v).strip()
+
+            inserted=updated=errors=0; error_details=[]
+            for row_no,rec in enumerate(records, start=2):
                 try:
-                    name=str(get(rec,'name') or '').strip();batch=str(get(rec,'batch') or '').strip();expiry=str(get(rec,'expiry') or '').strip()
-                    if isinstance(get(rec,'expiry'),datetime):expiry=get(rec,'expiry').strftime('%Y-%m-%d')
-                    elif isinstance(get(rec,'expiry'),date):expiry=get(rec,'expiry').strftime('%Y-%m-%d')
-                    parse_date(expiry)
-                    vals=(name,batch,expiry,float(get(rec,'price') or 0),float(get(rec,'mrp') or get(rec,'price') or 0),float(get(rec,'cost') or 0),int(float(get(rec,'stock') or 0)),float(get(rec,'gst') or 0),str(get(rec,'supplier') or ''),str(get(rec,'manufacturer') or ''),str(get(rec,'pack') or ''))
-                    if not name:raise ValueError('missing Name')
-                    old=self.db.one('SELECT id FROM medicines WHERE name=? AND batch=?',(name,batch))
-                    if old:self.db.conn.execute('UPDATE medicines SET expiry=?,price=?,mrp=?,cost=?,stock=?,gst=?,supplier=?,manufacturer=?,pack=? WHERE id=?',(expiry,vals[3],vals[4],vals[5],vals[6],vals[7],vals[8],vals[9],vals[10],old['id']));updated+=1
-                    else:self.db.conn.execute('INSERT INTO medicines(name,batch,expiry,price,mrp,cost,stock,gst,supplier,manufacturer,pack) VALUES(?,?,?,?,?,?,?,?,?,?,?)',vals);inserted+=1
-                except Exception:errors+=1
-            self.db.conn.commit();self.inventory();messagebox.showinfo('Bulk import',f'Imported: {inserted}\nUpdated: {updated}\nSkipped/invalid: {errors}')
-        except Exception as e:messagebox.showerror('Bulk import failed',str(e))
+                    name=text(get(rec,'name'))
+                    if not name: raise ValueError('missing Name')
+                    molecule=text(get(rec,'molecule'))
+                    supplier=text(get(rec,'supplier'))
+                    batch=text(get(rec,'batch'))
+                    expiry=parse_date(get(rec,'expiry')).strftime('%Y-%m-%d')
+                    mrp=num(get(rec,'mrp'))
+                    price=num(get(rec,'price'), mrp)
+                    cost=num(get(rec,'cost'))
+                    stock=int(num(get(rec,'stock')))
+                    gst=num(get(rec,'gst'))
+                    manufacturer=text(get(rec,'manufacturer'))
+                    pack=text(get(rec,'pack'))
+                    vals=(name,molecule,batch,expiry,price,mrp,cost,stock,gst,supplier,manufacturer,pack)
+                    old=self.db.one(
+                        "SELECT * FROM medicines WHERE lower(trim(name))=? AND lower(trim(COALESCE(molecule,'')))=? AND lower(trim(COALESCE(supplier,'')))=? ORDER BY id LIMIT 1",
+                        (name.lower(),molecule.lower(),supplier.lower()))
+                    if old:
+                        self.db.conn.execute(
+                            "UPDATE medicines SET stock=stock+?, mrp=?, price=?, cost=?, gst=?, manufacturer=?, pack=?, expiry=?, batch=?, updated_by=? WHERE id=?",
+                            (stock,mrp,price,cost,gst,manufacturer,pack,expiry,batch,old['id']))
+                        updated+=1
+                    else:
+                        self.db.conn.execute(
+                            "INSERT INTO medicines(name,molecule,batch,expiry,price,mrp,cost,stock,gst,supplier,manufacturer,pack,created_by,updated_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",vals+(self.user['email'],self.user['email']))
+                        inserted+=1
+                except Exception as e:
+                    errors+=1
+                    if len(error_details)<8: error_details.append(f'Row {row_no}: {e}')
+            self.db.audit('Inventory Import','bulk','Imported',f'Imported {inserted}; updated {updated}; skipped {errors}',self.user['email'])
+            self.db.conn.commit()
+            self.inventory()
+            msg=f'Imported: {inserted}\nUpdated: {updated}\nSkipped/invalid: {errors}'
+            if error_details: msg += '\n\nFirst errors:\n'+'\n'.join(error_details)
+            messagebox.showinfo('Bulk import complete',msg)
+        except Exception as e:
+            messagebox.showerror('Bulk import failed',str(e))
     def customers(self):
         self.title('Customers','Every completed bill with a mobile number automatically saves or updates the customer.')
         f=tk.Frame(self.content,bg='#f8fafc');f.pack(fill='x',pady=(0,8));q=tk.StringVar();ent=tk.Entry(f,textvariable=q,width=45,bd=1,relief='solid');ent.pack(side='left',ipady=6);tk.Label(f,text='  Instant search',bg='#f8fafc',fg='#64748b').pack(side='left')
-        tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True);tv=ttk.Treeview(tvbox,columns=('name','phone','email','credit','total','last'),show='headings');tv.pack(side='left',fill='both',expand=True);tv_sb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);tv_sb.pack(side='right',fill='y');tv.configure(yscrollcommand=tv_sb.set)
-        for c,h in [('name','Name'),('phone','Mobile'),('email','Email'),('credit','Credit'),('total','Total Purchase'),('last','Last Purchase')]:tv.heading(c,text=h)
+        tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True);tv=ttk.Treeview(tvbox,columns=('name','phone','email','credit','total','last','saved_by'),show='headings');tv.pack(side='left',fill='both',expand=True);tv_sb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);tv_sb.pack(side='right',fill='y');tv.configure(yscrollcommand=tv_sb.set)
+        for c,h in [('name','Name'),('phone','Mobile'),('email','Email'),('credit','Credit'),('total','Total Purchase'),('last','Last Purchase'),('saved_by','Saved / Updated By')]:tv.heading(c,text=h)
         def refresh(*_):
             for x in tv.get_children():tv.delete(x)
             x='%'+q.get().strip()+'%'
-            for r in self.db.q('SELECT name,phone,email,credit,total_purchase,last_purchase FROM customers WHERE name LIKE ? OR phone LIKE ? ORDER BY last_purchase DESC',(x,x)):tv.insert('', 'end',values=(r['name'],r['phone'],r['email'],f"₹{r['credit']:.2f}",f"₹{r['total_purchase']:.2f}",r['last_purchase'] or '-'))
+            for r in self.db.q('SELECT name,phone,email,credit,total_purchase,last_purchase,COALESCE(updated_by,created_by,'') AS saved_by FROM customers WHERE name LIKE ? OR phone LIKE ? ORDER BY last_purchase DESC',(x,x)):tv.insert('', 'end',values=(r['name'],r['phone'],r['email'],f"₹{r['credit']:.2f}",f"₹{r['total_purchase']:.2f}",r['last_purchase'] or '-'))
         q.trace_add('write',refresh);refresh()
     def sales(self):
         self.title('Sales','Search and filter bills instantly. Export the filtered bills to Excel or double-click a bill to open its PDF.')
@@ -577,10 +669,10 @@ class App:
         self.button(f,'Export Excel',self.export_excel,kind='success').grid(row=1,column=2,columnspan=2,sticky='w',padx=4,pady=3)
         for v in [self.sf,self.sfrom,self.sto,self.spay]:v.trace_add('write',lambda *_:self.refresh_sales())
         tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True)
-        self.sales_tv=ttk.Treeview(tvbox,columns=('invoice','date','time','customer','phone','payment','subtotal','gst','total','sms'),show='headings');self.sales_tv.pack(side='left',fill='both',expand=True)
+        self.sales_tv=ttk.Treeview(tvbox,columns=('invoice','date','time','customer','phone','payment','subtotal','gst','total','sms','saved_by'),show='headings');self.sales_tv.pack(side='left',fill='both',expand=True)
         vsb=ttk.Scrollbar(tvbox,orient='vertical',command=self.sales_tv.yview);vsb.pack(side='right',fill='y')
         hsb=ttk.Scrollbar(self.content,orient='horizontal',command=self.sales_tv.xview);hsb.pack(fill='x',pady=(0,6));self.sales_tv.configure(yscrollcommand=vsb.set,xscrollcommand=hsb.set)
-        headers=[('invoice','Invoice',190),('date','Date',100),('time','Time',85),('customer','Customer',170),('phone','Mobile',120),('payment','Payment',90),('subtotal','Taxable',95),('gst','GST',80),('total','Total',95),('sms','SMS',110)]
+        headers=[('invoice','Invoice',190),('date','Date',100),('time','Time',85),('customer','Customer',170),('phone','Mobile',120),('payment','Payment',90),('subtotal','Taxable',95),('gst','GST',80),('total','Total',95),('sms','SMS',110),('saved_by','Saved By',190)]
         for c,h,w in headers:self.sales_tv.heading(c,text=h);self.sales_tv.column(c,width=w,minwidth=70,stretch=False)
         self.sales_tv.bind('<Double-1>',lambda e:self.open_selected_bill_pdf());self.refresh_sales()
 
@@ -590,20 +682,20 @@ class App:
         if self.sfrom.get().strip():where.append('bill_date>=?');args.append(self.sfrom.get().strip())
         if self.sto.get().strip():where.append('bill_date<=?');args.append(self.sto.get().strip())
         if self.spay.get()!='All':where.append('payment=?');args.append(self.spay.get())
-        return self.db.q('SELECT invoice,bill_date,bill_time,customer_name,customer_phone,payment,subtotal,gst,total,sms_status FROM bills'+((' WHERE '+' AND '.join(where)) if where else '')+' ORDER BY id DESC',args)
+        return self.db.q('SELECT invoice,bill_date,bill_time,customer_name,customer_phone,payment,subtotal,gst,total,sms_status,created_by FROM bills'+((' WHERE '+' AND '.join(where)) if where else '')+' ORDER BY id DESC',args)
     def refresh_sales(self):
         if not hasattr(self,'sales_tv'):return
         for x in self.sales_tv.get_children():self.sales_tv.delete(x)
-        for r in self.sales_rows():self.sales_tv.insert('', 'end',values=(r['invoice'],fmt_date(r['bill_date']),r['bill_time'],r['customer_name'],r['customer_phone'],r['payment'],f"₹{r['subtotal']:.2f}",f"₹{r['gst']:.2f}",f"₹{r['total']:.2f}",r['sms_status']))
+        for r in self.sales_rows():self.sales_tv.insert('', 'end',values=(r['invoice'],fmt_date(r['bill_date']),r['bill_time'],r['customer_name'],r['customer_phone'],r['payment'],f"₹{r['subtotal']:.2f}",f"₹{r['gst']:.2f}",f"₹{r['total']:.2f}",r['sms_status'],r['created_by']))
     def export_excel(self):
         if Workbook is None:messagebox.showerror('Excel','Excel support is unavailable.');return
         rows=self.sales_rows();path=filedialog.asksaveasfilename(defaultextension='.xlsx',initialfile=f'MediBill_Bills_{datetime.now():%Y%m%d_%H%M%S}.xlsx',filetypes=[('Excel','*.xlsx')]);
         if not path:return
         wb=Workbook();ws=wb.active;ws.title='Bills';ws.append(['Invoice','Date','Time','Customer','Mobile','Payment','Taxable','GST','Total','SMS Status'])
         for r in rows:ws.append([r['invoice'],r['bill_date'],r['bill_time'],r['customer_name'],r['customer_phone'],r['payment'],r['subtotal'],r['gst'],r['total'],r['sms_status']])
-        wi=wb.create_sheet('Bill Items');wi.append(['Invoice','Medicine','Batch','Qty','Price','GST %','Amount'])
+        wi=wb.create_sheet('Bill Items');wi.append(['Invoice','Medicine','Molecule','Batch','Qty','Price','GST %','Amount'])
         for r in rows:
-            for it in self.db.q('SELECT b.invoice,i.name,i.batch,i.qty,i.price,i.gst,i.amount FROM bill_items i JOIN bills b ON b.id=i.bill_id WHERE b.invoice=?',(r['invoice'],)):wi.append(list(it))
+            for it in self.db.q('SELECT b.invoice,i.name,i.molecule,i.batch,i.qty,i.price,i.gst,i.amount FROM bill_items i JOIN bills b ON b.id=i.bill_id WHERE b.invoice=?',(r['invoice'],)):wi.append(list(it))
         for wsx in wb.worksheets:
             wsx.freeze_panes='A2';wsx.auto_filter.ref=wsx.dimensions
             for col in wsx.columns:
@@ -706,7 +798,7 @@ class App:
         if r['role']=='Admin' and self.user['role']!='Admin':messagebox.showerror('Access','Only Admin can deactivate an Admin account.');return
         if not r['active']:return
         if not messagebox.askyesno('Deactivate account',f"Deactivate {r['name']}?\n\nThey will immediately lose login access. The account is retained so it can be rehired later."):return
-        self.db.conn.execute('UPDATE users SET active=0 WHERE id=?',(uid,));self.db.conn.commit();self.refresh_users(tv)
+        self.db.conn.execute('UPDATE users SET active=0 WHERE id=?',(uid,));self.db.audit('User',uid,'Deactivated',f'{r["email"]}',self.user['email']);self.db.conn.commit();self.refresh_users(tv)
 
     def rehire_user(self,tv):
         s=tv.selection()
@@ -715,7 +807,7 @@ class App:
         if not r or r['active'] :messagebox.showinfo('Rehire','Select a deactivated account.');return
         if r['role']=='Admin' and self.user['role']!='Admin':messagebox.showerror('Access','Only Admin can rehire an Admin account.');return
         if not messagebox.askyesno('Rehire account',f"Rehire {r['name']}?\n\nThe existing email, role and password will be restored."):return
-        self.db.conn.execute('UPDATE users SET active=1 WHERE id=?',(uid,));self.db.conn.commit();self.refresh_users(tv)
+        self.db.conn.execute('UPDATE users SET active=1 WHERE id=?',(uid,));self.db.audit('User',uid,'Rehired',f'{r["email"]}',self.user['email']);self.db.conn.commit();self.refresh_users(tv)
 
     def assign_role(self,tv,role):
         s=tv.selection()
@@ -728,7 +820,7 @@ class App:
             messagebox.showerror('Access','Only the Store Manager can assign or change worker roles. Admin has full page access but does not assign roles.'); return
         if r['role']=='Admin':
             messagebox.showerror('Access','Admin role cannot be assigned or changed from this screen.'); return
-        self.db.conn.execute('UPDATE users SET role=? WHERE id=?',(role.get(),uid)); self.db.conn.commit(); self.users()
+        self.db.conn.execute('UPDATE users SET role=? WHERE id=?',(role.get(),uid)); self.db.audit('User',uid,'Role changed',f'Role: {role.get()}',self.user['email']); self.db.conn.commit(); self.users()
 
     def reset_user_password(self,tv):
         s=tv.selection()
@@ -744,7 +836,7 @@ class App:
         def save():
             if not strong_pw(e1.get()):messagebox.showerror('Validation','Password needs 8+ characters with uppercase, lowercase, number and special character.',parent=win);return
             if e1.get()!=e2.get():messagebox.showerror('Validation','Passwords do not match.',parent=win);return
-            salt,d=hash_pw(e1.get());self.db.conn.execute('UPDATE users SET salt=?,password_hash=?,must_change=1 WHERE id=?',(salt,d,uid));self.db.conn.commit();win.destroy();messagebox.showinfo('Password reset','Password reset. The worker will be asked to change it at next login.')
+            salt,d=hash_pw(e1.get());self.db.conn.execute('UPDATE users SET salt=?,password_hash=?,must_change=1 WHERE id=?',(salt,d,uid));self.db.audit('User',uid,'Password reset',f'{r["email"]}',self.user['email']);self.db.conn.commit();win.destroy();messagebox.showinfo('Password reset','Password reset. The worker will be asked to change it at next login.')
         self.button(frm,'Reset Password',save,kind='success').pack(anchor='w',pady=18)
 
     def sms_outbox(self):
@@ -752,6 +844,23 @@ class App:
         tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True);tv=ttk.Treeview(tvbox,columns=('invoice','phone','status','created','response'),show='headings');tv.pack(side='left',fill='both',expand=True);sms_sb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);sms_sb.pack(side='right',fill='y');tv.configure(yscrollcommand=sms_sb.set)
         for c,h in [('invoice','Invoice'),('phone','Mobile'),('status','Status'),('created','Created'),('response','Provider Response')]:tv.heading(c,text=h)
         for r in self.db.q('SELECT b.invoice,o.phone,o.status,o.created_at,o.provider_response FROM sms_outbox o LEFT JOIN bills b ON b.id=o.bill_id ORDER BY o.id DESC'):tv.insert('', 'end',values=tuple(r))
+    def audit_log(self):
+        if self.user['role'] not in ['Admin','Store Manager']: return
+        self.title('Audit Log','See who created, changed, imported, reset or otherwise saved important data.')
+        bar=tk.Frame(self.content,bg='#eef2ff',padx=10,pady=8);bar.pack(fill='x',pady=(0,8))
+        q=tk.StringVar(); tk.Label(bar,text='Search',bg='#eef2ff',font=('Segoe UI',9,'bold')).pack(side='left')
+        ent=tk.Entry(bar,textvariable=q,width=45,bd=1,relief='solid');ent.pack(side='left',padx=8,ipady=5)
+        box=tk.Frame(self.content,bg='white');box.pack(fill='both',expand=True)
+        tv=ttk.Treeview(box,columns=('time','by','entity','id','action','details'),show='headings');tv.pack(side='left',fill='both',expand=True)
+        sb=ttk.Scrollbar(box,orient='vertical',command=tv.yview);sb.pack(side='right',fill='y');tv.configure(yscrollcommand=sb.set)
+        hb=ttk.Scrollbar(self.content,orient='horizontal',command=tv.xview);hb.pack(fill='x',pady=(0,6));tv.configure(xscrollcommand=hb.set)
+        for c,h,w in [('time','Date / Time',155),('by','Saved By',220),('entity','Entity',130),('id','ID',80),('action','Action',150),('details','Details',500)]: tv.heading(c,text=h);tv.column(c,width=w,minwidth=80,stretch=False)
+        def refresh(*_):
+            for x in tv.get_children():tv.delete(x)
+            term=q.get().strip(); rows=self.db.q("SELECT performed_at,performed_by,entity_type,entity_id,action,details FROM audit_log WHERE performed_by LIKE ? OR entity_type LIKE ? OR action LIKE ? OR details LIKE ? ORDER BY id DESC", tuple('%'+term+'%' for _ in range(4)))
+            for r in rows: tv.insert('', 'end',values=tuple(r))
+        q.trace_add('write',refresh);refresh()
+
     def settings(self):
         self.title('Settings','Company information and direct MSG91 SMS configuration. No backend server is required.')
         box=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0',padx=18,pady=18);box.pack(fill='x')
@@ -797,7 +906,7 @@ class App:
         }); self.sms.save(); messagebox.showinfo('Shop details','Shop details saved. They will appear on future invoices.'); self.dashboard()
 
     def save_company(self,var):
-        name=var.get().strip() or DEFAULT_COMPANY;self.company=name;self.sms.s['company_name']=name;self.sms.save();messagebox.showinfo('Company','Company name saved. It will appear on the app and future PDFs.');self.dashboard()
+        name=var.get().strip() or DEFAULT_COMPANY;self.company=name;self.sms.s['company_name']=name;self.sms.save();self.db.audit('Settings','company','Updated',f'Company name: {name}',self.user['email']);self.db.conn.commit();messagebox.showinfo('Company','Company name saved. It will appear on the app and future PDFs.');self.dashboard()
     def save_sms(self,auth,flow,sender):
         self.sms.s.update({'msg91_authkey':auth.get().strip(),'msg91_flow_id':flow.get().strip(),'msg91_sender_id':sender.get().strip(),'company_name':self.company})
         self.sms.save()
@@ -840,7 +949,7 @@ class App:
                 if not strong_pw(np): messagebox.showerror('Validation','New password needs 8+ characters with uppercase, lowercase, number and special character.'); return
                 if np!=cf: messagebox.showerror('Validation','New passwords do not match.'); return
                 salt,d=hash_pw(np)
-            self.db.conn.execute('UPDATE users SET name=?,email=?,salt=?,password_hash=?,must_change=0 WHERE id=?',(nm,em,salt,d,self.user['id'])); self.db.conn.commit()
+            self.db.conn.execute('UPDATE users SET name=?,email=?,salt=?,password_hash=?,must_change=0 WHERE id=?',(nm,em,salt,d,self.user['id'])); self.db.audit('User',self.user['id'],'Account updated','Name/email/password updated',self.user['email']); self.db.conn.commit()
             self.user=dict(self.db.one('SELECT * FROM users WHERE id=?',(self.user['id'],))); self.company=self.sms.s.get('company_name',self.company)
             messagebox.showinfo('Account updated','Your account details have been updated.'); self.dashboard()
         self.button(box,'Save Account Changes',save,kind='success').grid(row=6,column=1,sticky='w',padx=15,pady=12)
@@ -858,7 +967,7 @@ class App:
             if not verify_pw(old.get(),row['salt'],row['password_hash']): messagebox.showerror('Validation','Current password is incorrect.',parent=win); return
             if not strong_pw(new.get()): messagebox.showerror('Validation','Password needs 8+ characters with uppercase, lowercase, number and special character.',parent=win); return
             if new.get()!=cf.get(): messagebox.showerror('Validation','Passwords do not match.',parent=win); return
-            salt,d=hash_pw(new.get()); self.db.conn.execute('UPDATE users SET salt=?,password_hash=?,must_change=0 WHERE id=?',(salt,d,self.user['id'])); self.db.conn.commit(); self.user=dict(self.db.one('SELECT * FROM users WHERE id=?',(self.user['id'],))); win.destroy(); messagebox.showinfo('Security','Admin password changed successfully.')
+            salt,d=hash_pw(new.get()); self.db.conn.execute('UPDATE users SET salt=?,password_hash=?,must_change=0 WHERE id=?',(salt,d,self.user['id'])); self.db.audit('User',self.user['id'],'Password changed','Admin first-time password changed',self.user['email']); self.db.conn.commit(); self.user=dict(self.db.one('SELECT * FROM users WHERE id=?',(self.user['id'],))); win.destroy(); messagebox.showinfo('Security','Admin password changed successfully.')
         self.button(frm,'Save New Password',save,kind='success').pack(anchor='w',pady=20)
         win.protocol('WM_DELETE_WINDOW',lambda:(win.destroy()))
 
