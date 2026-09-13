@@ -191,7 +191,7 @@ class App:
     def __init__(self):
         self.db=DB(); self.sms=SMS(); self.user=None; self.cart=[]; self.last_invoice=None; self.last_bill_id=None; self.company=self.sms.s.get('company_name',DEFAULT_COMPANY)
         self.root=tk.Tk(); self.root.withdraw(); self.root.title(APP_NAME); self.root.geometry('1280x800'); self.root.minsize(1100,700); self.root.protocol('WM_DELETE_WINDOW',self.close)
-        self.setup_style(); self.login()
+        self.setup_style(); self.root.deiconify(); self.login(); self.root.deiconify(); self.root.lift(); self.root.focus_force()
     def setup_style(self):
         style=ttk.Style();
         try: style.theme_use('clam')
