@@ -11,40 +11,27 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
-      - name: Get source code
+      - name: Checkout source
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
-        shell: cmd
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
-
-      - name: Build MediBill
-        shell: cmd
-        run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name MediBill main.py
-
+          python -m pip install -r requirements.txt pyinstaller
+      - name: Build standalone EXE
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MediBill main.py
       - name: Verify EXE
         shell: powershell
         run: |
-          if (!(Test-Path "dist\MediBill.exe")) {
-            Write-Error "MediBill.exe was not created."
-          }
+          if (!(Test-Path "dist\MediBill.exe")) { throw "MediBill.exe was not created" }
           Get-Item "dist\MediBill.exe"
-
-      - name: Upload MediBill.exe
+      - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: MediBill-Windows-EXE
           path: dist/MediBill.exe
           if-no-files-found: error
-
