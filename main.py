@@ -27,10 +27,10 @@ os.makedirs(PDF_DIR, exist_ok=True)
 
 ROLES = ['Admin', 'Store Manager', 'Cashier', 'Accounts']
 PERMS = {
-    'Admin': {'dashboard','billing','inventory','customers','sales','reports','settings','users','sms'},
-    'Store Manager': {'dashboard','billing','inventory','customers','sales','reports','settings','users','sms'},
-    'Cashier': {'dashboard','billing','customers','sms'},
-    'Accounts': {'dashboard','customers','sales','reports'},
+    'Admin': {'dashboard','billing','inventory','customers','sales','reports','settings','users','sms','account'},
+    'Store Manager': {'dashboard','billing','inventory','customers','sales','reports','settings','users','sms','account'},
+    'Cashier': {'dashboard','billing','customers','sms','account'},
+    'Accounts': {'dashboard','customers','sales','reports','account'},
 }
 
 def money(v):
@@ -77,16 +77,20 @@ class DB:
     def init(self):
         c = self.conn.cursor()
         c.executescript('''
-        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL, verified INTEGER DEFAULT 1, active INTEGER DEFAULT 1, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL, verified INTEGER DEFAULT 1, active INTEGER DEFAULT 1, must_change INTEGER DEFAULT 0, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT UNIQUE NOT NULL, email TEXT DEFAULT '', address TEXT DEFAULT '', credit REAL DEFAULT 0, total_purchase REAL DEFAULT 0, last_purchase TEXT);
         CREATE TABLE IF NOT EXISTS medicines(id INTEGER PRIMARY KEY, name TEXT NOT NULL, batch TEXT DEFAULT '', expiry TEXT DEFAULT '', price REAL DEFAULT 0, cost REAL DEFAULT 0, stock INTEGER DEFAULT 0, gst REAL DEFAULT 0, supplier TEXT DEFAULT '', UNIQUE(name,batch));
         CREATE TABLE IF NOT EXISTS bills(id INTEGER PRIMARY KEY, invoice TEXT UNIQUE NOT NULL, bill_date TEXT NOT NULL, bill_time TEXT NOT NULL, customer_id INTEGER, customer_name TEXT, customer_phone TEXT, payment TEXT, subtotal REAL, gst REAL, total REAL, sms_status TEXT DEFAULT 'Not sent', created_by TEXT, FOREIGN KEY(customer_id) REFERENCES customers(id));
         CREATE TABLE IF NOT EXISTS bill_items(id INTEGER PRIMARY KEY, bill_id INTEGER NOT NULL, medicine_id INTEGER, name TEXT, batch TEXT, qty INTEGER, price REAL, gst REAL, amount REAL, FOREIGN KEY(bill_id) REFERENCES bills(id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS sms_outbox(id INTEGER PRIMARY KEY, bill_id INTEGER, phone TEXT, message TEXT, status TEXT, provider_response TEXT DEFAULT '', created_at TEXT, FOREIGN KEY(bill_id) REFERENCES bills(id));
         ''')
+        # Migrate older databases created before the credential-change feature.
+        cols={r['name'] for r in c.execute('PRAGMA table_info(users)').fetchall()}
+        if 'must_change' not in cols:
+            c.execute('ALTER TABLE users ADD COLUMN must_change INTEGER DEFAULT 0')
         if not c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
             for name,email,pw,role in [('Administrator','admin@medibillwb.in','Admin@1234','Admin'),('Store Manager','store@medibillwb.in','Demo@1234','Store Manager'),('Cashier','cashier@medibillwb.in','Demo@1234','Cashier'),('Accounts','accounts@medibillwb.in','Demo@1234','Accounts')]:
-                salt,d=hash_pw(pw); c.execute('INSERT INTO users(name,email,salt,password_hash,role,created_at) VALUES(?,?,?,?,?,?)',(name,email,salt,d,role,datetime.now().isoformat(timespec='seconds')))
+                salt,d=hash_pw(pw); c.execute('INSERT INTO users(name,email,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(name,email,salt,d,role,1,1,1 if email=='admin@medibillwb.in' else 0,datetime.now().isoformat(timespec='seconds')))
         if not c.execute('SELECT 1 FROM medicines LIMIT 1').fetchone():
             meds=[('Paracetamol 500mg','PCT001','2027-08-31',25,12,80,5,'Demo Supplier'),('Azithromycin 500mg','AZI001','2027-03-31',85,48,25,5,'Demo Supplier'),('ORS Lemon','ORS001','2028-01-31',22,13,50,5,'Demo Supplier'),('Pantoprazole 40mg','PAN001','2027-11-30',60,30,35,12,'Demo Supplier'),('Vitamin C 500mg','VIT001','2026-11-30',35,20,7,12,'Demo Supplier'),('Cetirizine 10mg','CET001','2026-10-15',18,9,15,5,'Demo Supplier')]
             c.executemany('INSERT INTO medicines(name,batch,expiry,price,cost,stock,gst,supplier) VALUES(?,?,?,?,?,?,?,?)',meds)
@@ -190,7 +194,7 @@ class DatePicker(tk.Toplevel):
 class App:
     def __init__(self):
         self.db=DB(); self.sms=SMS(); self.user=None; self.cart=[]; self.last_invoice=None; self.last_bill_id=None; self.company=self.sms.s.get('company_name',DEFAULT_COMPANY)
-        self.root=tk.Tk(); self.root.withdraw(); self.root.title(APP_NAME); self.root.geometry('1280x800'); self.root.minsize(1100,700); self.root.protocol('WM_DELETE_WINDOW',self.close)
+        self.last_bill=None; self.root=tk.Tk(); self.root.withdraw(); self.root.title(APP_NAME); self.root.geometry('1280x800'); self.root.minsize(1100,700); self.root.protocol('WM_DELETE_WINDOW',self.close)
         self.setup_style(); self.root.deiconify(); self.login(); self.root.deiconify(); self.root.lift(); self.root.focus_force()
     def setup_style(self):
         style=ttk.Style();
@@ -219,7 +223,10 @@ class App:
         def go(event=None):
             row=self.db.one('SELECT * FROM users WHERE lower(email)=? AND active=1',(email.get().strip().lower(),))
             if not row or not verify_pw(pw.get(),row['salt'],row['password_hash']): messagebox.showerror('Login failed','Invalid email or password.'); return
-            self.user=dict(row); self.dashboard()
+            self.user=dict(row)
+            self.dashboard()
+            if int(self.user.get('must_change',0)):
+                self.after_login_change_credentials()
         self.button(card,'Login',go,kind='primary').pack(fill='x',pady=20,ipady=3); p.bind('<Return>',go)
         tk.Label(card,text='First time? Worker accounts can be created here and assigned a role by Store Manager/Admin.',bg='white',fg='#64748b',wraplength=400).pack(pady=3)
         self.button(card,'Create Worker Account',self.register,kind='dark').pack(pady=8)
@@ -235,16 +242,27 @@ class App:
             if not strong_pw(p1): messagebox.showerror('Validation','Password needs 8+ chars with upper, lower, number and special character.',parent=win); return
             if p1!=p2: messagebox.showerror('Validation','Passwords do not match.',parent=win); return
             if self.db.one('SELECT 1 FROM users WHERE lower(email)=?',(email.lower(),)): messagebox.showerror('Validation','This email already has an account.',parent=win); return
-            salt,d=hash_pw(p1); self.db.conn.execute('INSERT INTO users(name,email,salt,password_hash,role,verified,created_at) VALUES(?,?,?,?,?,?,?)',(name,email,salt,d,'Cashier',1,datetime.now().isoformat(timespec='seconds'))); self.db.conn.commit(); win.destroy(); messagebox.showinfo('Created','Account created. A Store Manager/Admin can assign its role.')
+            salt,d=hash_pw(p1); self.db.conn.execute('INSERT INTO users(name,email,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(name,email,salt,d,'Cashier',1,1,0,datetime.now().isoformat(timespec='seconds'))); self.db.conn.commit(); win.destroy(); messagebox.showinfo('Created','Account created. A Store Manager/Admin can assign its role.')
         self.button(frm,'Create Account',save,kind='success').grid(row=9,column=0,columnspan=2,pady=8)
     def title(self,title,subtitle=''):
         for w in self.content.winfo_children(): w.destroy()
         head=tk.Frame(self.content,bg='#f8fafc'); head.pack(fill='x',pady=(0,18)); tk.Label(head,text=title,bg='#f8fafc',fg='#0f172a',font=('Segoe UI',22,'bold')).pack(anchor='w'); tk.Label(head,text=subtitle,bg='#f8fafc',fg='#64748b',font=('Segoe UI',10)).pack(anchor='w',pady=(2,0))
     def dashboard(self):
-        self.clear(); self.root.geometry('1280x800'); outer=tk.Frame(self.root,bg='#f8fafc'); outer.pack(fill='both',expand=True)
-        side=tk.Frame(outer,bg='#0f172a',width=220); side.pack(side='left',fill='y'); side.pack_propagate(False); self.content=tk.Frame(outer,bg='#f8fafc',padx=22,pady=20); self.content.pack(side='left',fill='both',expand=True)
+        self.clear(); self.root.geometry('1280x720'); self.root.minsize(1100,650); outer=tk.Frame(self.root,bg='#f8fafc'); outer.pack(fill='both',expand=True)
+        side=tk.Frame(outer,bg='#0f172a',width=220); side.pack(side='left',fill='y'); side.pack_propagate(False)
+        mainwrap=tk.Frame(outer,bg='#f8fafc'); mainwrap.pack(side='left',fill='both',expand=True)
+        self.content_canvas=tk.Canvas(mainwrap,bg='#f8fafc',highlightthickness=0,bd=0)
+        content_scroll=ttk.Scrollbar(mainwrap,orient='vertical',command=self.content_canvas.yview)
+        self.content_canvas.configure(yscrollcommand=content_scroll.set)
+        content_scroll.pack(side='right',fill='y'); self.content_canvas.pack(side='left',fill='both',expand=True)
+        self.content=tk.Frame(self.content_canvas,bg='#f8fafc',padx=22,pady=20)
+        self._content_window=self.content_canvas.create_window((0,0),window=self.content,anchor='nw')
+        self.content.bind('<Configure>',lambda e:self.content_canvas.configure(scrollregion=self.content_canvas.bbox('all')))
+        self.content_canvas.bind('<Configure>',lambda e:self.content_canvas.itemconfigure(self._content_window,width=e.width))
+        self.content_canvas.bind('<MouseWheel>',lambda e:self.content_canvas.yview_scroll(int(-e.delta/120),'units'))
+        self.content.bind('<MouseWheel>',lambda e:self.content_canvas.yview_scroll(int(-e.delta/120),'units'))
         tk.Label(side,text='MediBill',bg='#0f172a',fg='white',font=('Segoe UI',21,'bold')).pack(anchor='w',padx=20,pady=(25,2)); tk.Label(side,text=self.company,bg='#0f172a',fg='#94a3b8',font=('Segoe UI',9),wraplength=180).pack(anchor='w',padx=20,pady=(0,15)); tk.Label(side,text=f"{self.user['name']}\n{self.user['role']}",bg='#1e293b',fg='#e2e8f0',justify='left',anchor='w',padx=12,pady=10).pack(fill='x',padx=12,pady=(0,15))
-        items=[('Dashboard','dashboard_home'),('Billing','billing'),('Inventory','inventory'),('Customers','customers'),('Sales','sales'),('Reports','reports'),('SMS Outbox','sms_outbox'),('Settings','settings'),('Users & Roles','users')]
+        items=[('Dashboard','dashboard_home'),('Billing','billing'),('Inventory','inventory'),('Customers','customers'),('Sales','sales'),('Reports','reports'),('SMS Outbox','sms_outbox'),('Settings','settings'),('Users & Roles','users'),('My Account','account')]
         for label,method in items:
             perm='dashboard' if method=='dashboard_home' else method
             if perm not in PERMS.get(self.user['role'],set()): continue
@@ -277,15 +295,27 @@ class App:
         for i,(lab,var) in enumerate([('Customer name',self.b_name),('Mobile number',self.b_phone)]): tk.Label(info,text=lab,bg='white',fg='#475569').grid(row=0,column=i*2,sticky='w',padx=5); tk.Entry(info,textvariable=var,width=27,bd=1,relief='solid').grid(row=1,column=i*2,columnspan=2,padx=5,ipady=6,sticky='ew')
         tk.Label(info,text='Payment method',bg='white',fg='#475569').grid(row=0,column=4,sticky='w',padx=5); ttk.Combobox(info,textvariable=self.b_payment,values=['Cash','UPI','Card','Credit'],state='readonly',width=14).grid(row=1,column=4,padx=5,sticky='w')
         tk.Label(self.content,text='Find medicine',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',13,'bold')).pack(anchor='w',pady=(18,6)); sf=tk.Frame(self.content,bg='#f8fafc'); sf.pack(fill='x'); search=tk.Entry(sf,textvariable=self.b_search,font=('Segoe UI',11),bd=1,relief='solid'); search.pack(side='left',fill='x',expand=True,ipady=7); tk.Label(sf,text='  Type to search instantly',bg='#f8fafc',fg='#64748b').pack(side='left')
-        self.bill_results=ttk.Treeview(self.content,columns=('id','name','batch','price','stock'),show='headings',height=5); self.bill_results.pack(fill='x',pady=8)
+        results_box=tk.Frame(self.content,bg='#f8fafc'); results_box.pack(fill='x',pady=8)
+        self.bill_results=ttk.Treeview(results_box,columns=('id','name','batch','price','stock'),show='headings',height=5); self.bill_results.pack(side='left',fill='both',expand=True)
+        rsb=ttk.Scrollbar(results_box,orient='vertical',command=self.bill_results.yview); rsb.pack(side='right',fill='y'); self.bill_results.configure(yscrollcommand=rsb.set)
         for c,h in [('id','ID'),('name','Medicine'),('batch','Batch'),('price','Selling Price'),('stock','Available')]: self.bill_results.heading(c,text=h)
         self.bill_results.bind('<Double-1>',lambda e:self.add_selected()); self.bill_results.bind('<Return>',lambda e:self.add_selected()); self.bill_search()
         tk.Label(self.content,text='Bill items',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',13,'bold')).pack(anchor='w',pady=(10,6))
-        cartbox=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0'); cartbox.pack(fill='both',expand=True); self.cart_tv=ttk.Treeview(cartbox,columns=('name','qty','price','gst','amount'),show='headings',height=8); self.cart_tv.pack(fill='both',expand=True); 
+        cartbox=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0'); cartbox.pack(fill='x',expand=False)
+        cart_table=tk.Frame(cartbox,bg='white'); cart_table.pack(fill='x',expand=False)
+        self.cart_tv=ttk.Treeview(cart_table,columns=('name','qty','price','gst','amount'),show='headings',height=5); self.cart_tv.pack(side='left',fill='both',expand=True)
+        cart_sb=ttk.Scrollbar(cart_table,orient='vertical',command=self.cart_tv.yview); cart_sb.pack(side='right',fill='y'); self.cart_tv.configure(yscrollcommand=cart_sb.set)
+        
         for c,h in [('name','Medicine'),('qty','Quantity'),('price','Price'),('gst','GST %'),('amount','Amount')]: self.cart_tv.heading(c,text=h)
-        self.cart_tv.bind('<Double-1>',lambda e:self.edit_cart_qty())
-        actions=tk.Frame(self.content,bg='#f8fafc'); actions.pack(fill='x',pady=8); self.button(actions,'− Decrease',lambda:self.change_qty(-1),kind='dark').pack(side='left',padx=3); self.button(actions,'+ Increase',lambda:self.change_qty(1),kind='dark').pack(side='left',padx=3); self.button(actions,'Remove',self.remove_cart,kind='danger').pack(side='left',padx=3); self.button(actions,'Clear Bill',self.clear_bill,kind='dark').pack(side='left',padx=3)
-        foot=tk.Frame(self.content,bg='#f8fafc'); foot.pack(fill='x'); self.total_lbl=tk.Label(foot,text='Total: ₹0.00',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',20,'bold')); self.total_lbl.pack(side='left',pady=8)
+        self.cart_tv.bind('<Double-1>',lambda e:self.edit_cart_qty()); self.cart_tv.bind('<Delete>',lambda e:self.remove_cart())
+        actions=tk.Frame(self.content,bg='#e2e8f0',highlightthickness=1,highlightbackground='#cbd5e1'); actions.pack(fill='x',pady=(8,5),ipady=4)
+        tk.Label(actions,text='Selected item:',bg='#e2e8f0',fg='#475569',font=('Segoe UI',9,'bold')).pack(side='left',padx=(8,5))
+        self.button(actions,'− Decrease',lambda:self.change_qty(-1),kind='dark').pack(side='left',padx=3)
+        self.button(actions,'+ Increase',lambda:self.change_qty(1),kind='success').pack(side='left',padx=3)
+        self.button(actions,'Remove Item',self.remove_cart,kind='danger').pack(side='left',padx=3)
+        self.button(actions,'Clear Bill',self.clear_bill,kind='dark').pack(side='left',padx=3)
+        tk.Label(actions,text='Tip: select a row, then use + / − or Delete. Double-click quantity to edit.',bg='#e2e8f0',fg='#64748b').pack(side='right',padx=8)
+        foot=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#cbd5e1'); foot.pack(fill='x',pady=(2,0),ipady=5); self.total_lbl=tk.Label(foot,text='Total: ₹0.00',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',20,'bold')); self.total_lbl.pack(side='left',pady=8)
         self.generate_btn=self.button(foot,'Generate Bill',self.checkout,kind='success'); self.generate_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.sms_btn=self.button(foot,'Send SMS',self.send_last_sms,kind='primary'); self.sms_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.pdf_btn=self.button(foot,'Print / Save PDF',self.generate_last_pdf,kind='dark'); self.pdf_btn.pack(side='right',padx=4,ipadx=8,ipady=5); self.sms_btn.configure(state='disabled'); self.pdf_btn.configure(state='disabled')
         self.b_search.trace_add('write',lambda *_:self.bill_search()); search.focus_set()
     def bill_search(self):
@@ -397,7 +427,9 @@ class App:
                 self.db.conn.execute('INSERT INTO medicines(name,batch,expiry,price,cost,stock,gst,supplier) VALUES(?,?,?,?,?,?,?,?)',vals);self.db.conn.commit();refresh();[v.set('') for v in vars]
             except Exception as e:messagebox.showerror('Inventory','Please check the medicine fields.\n\n'+str(e))
         self.button(form,'Add Medicine',add,kind='success').grid(row=4,column=0,padx=5,pady=5,sticky='w')
-        tv=ttk.Treeview(self.content,columns=('id','name','batch','expiry','price','stock','gst','supplier'),show='headings');tv.pack(fill='both',expand=True,pady=10)
+        tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True,pady=10)
+        tv=ttk.Treeview(tvbox,columns=('id','name','batch','expiry','price','stock','gst','supplier'),show='headings');tv.pack(side='left',fill='both',expand=True)
+        tvsb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);tvsb.pack(side='right',fill='y');tv.configure(yscrollcommand=tvsb.set)
         for c,h in [('id','ID'),('name','Medicine'),('batch','Batch'),('expiry','Expiry'),('price','Selling Price'),('stock','Stock'),('gst','GST %'),('supplier','Supplier')]:tv.heading(c,text=h)
         def refresh():
             for x in tv.get_children():tv.delete(x)
@@ -436,7 +468,8 @@ class App:
         except Exception as e:messagebox.showerror('Bulk import failed',str(e))
     def customers(self):
         self.title('Customers','Every completed bill with a mobile number automatically saves or updates the customer.')
-        f=tk.Frame(self.content,bg='#f8fafc');f.pack(fill='x',pady=(0,8));q=tk.StringVar();ent=tk.Entry(f,textvariable=q,width=45,bd=1,relief='solid');ent.pack(side='left',ipady=6);tk.Label(f,text='  Instant search',bg='#f8fafc',fg='#64748b').pack(side='left');tv=ttk.Treeview(self.content,columns=('name','phone','email','credit','total','last'),show='headings');tv.pack(fill='both',expand=True)
+        f=tk.Frame(self.content,bg='#f8fafc');f.pack(fill='x',pady=(0,8));q=tk.StringVar();ent=tk.Entry(f,textvariable=q,width=45,bd=1,relief='solid');ent.pack(side='left',ipady=6);tk.Label(f,text='  Instant search',bg='#f8fafc',fg='#64748b').pack(side='left')
+        tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True);tv=ttk.Treeview(tvbox,columns=('name','phone','email','credit','total','last'),show='headings');tv.pack(side='left',fill='both',expand=True);tv_sb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);tv_sb.pack(side='right',fill='y');tv.configure(yscrollcommand=tv_sb.set)
         for c,h in [('name','Name'),('phone','Mobile'),('email','Email'),('credit','Credit'),('total','Total Purchase'),('last','Last Purchase')]:tv.heading(c,text=h)
         def refresh(*_):
             for x in tv.get_children():tv.delete(x)
@@ -448,7 +481,7 @@ class App:
         f=tk.Frame(self.content,bg='#f8fafc');f.pack(fill='x',pady=(0,8));self.sf=tk.StringVar();self.sfrom=tk.StringVar();self.sto=tk.StringVar();self.spay=tk.StringVar(value='All')
         tk.Label(f,text='Search',bg='#f8fafc').pack(side='left');tk.Entry(f,textvariable=self.sf,width=22,bd=1,relief='solid').pack(side='left',padx=5,ipady=5);tk.Label(f,text='From',bg='#f8fafc').pack(side='left');self.date_entry(f,self.sfrom,11);tk.Label(f,text='To',bg='#f8fafc').pack(side='left');self.date_entry(f,self.sto,11);tk.Label(f,text='Payment',bg='#f8fafc').pack(side='left');ttk.Combobox(f,textvariable=self.spay,values=['All','Cash','UPI','Card','Credit'],state='readonly',width=10).pack(side='left',padx=5);self.button(f,'Export Excel',self.export_excel,kind='success').pack(side='left',padx=5)
         for v in [self.sf,self.sfrom,self.sto,self.spay]:v.trace_add('write',lambda *_:self.refresh_sales())
-        tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True);self.sales_tv=ttk.Treeview(tvbox,columns=('invoice','date','time','customer','phone','payment','subtotal','gst','total','sms'),show='headings');self.sales_tv.pack(fill='both',expand=True)
+        tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True);self.sales_tv=ttk.Treeview(tvbox,columns=('invoice','date','time','customer','phone','payment','subtotal','gst','total','sms'),show='headings');self.sales_tv.pack(side='left',fill='both',expand=True);sales_sb=ttk.Scrollbar(tvbox,orient='vertical',command=self.sales_tv.yview);sales_sb.pack(side='right',fill='y');self.sales_tv.configure(yscrollcommand=sales_sb.set)
         for c,h in [('invoice','Invoice'),('date','Date'),('time','Time'),('customer','Customer'),('phone','Mobile'),('payment','Payment'),('subtotal','Taxable'),('gst','GST'),('total','Total'),('sms','SMS')]:self.sales_tv.heading(c,text=h)
         self.sales_tv.bind('<Double-1>',lambda e:self.open_selected_bill_pdf());self.refresh_sales()
     def sales_rows(self):
@@ -486,25 +519,58 @@ class App:
         cards=tk.Frame(self.content,bg='#f8fafc');cards.pack(fill='x');today=datetime.now().strftime('%Y-%m-%d');month=datetime.now().strftime('%Y-%m')
         vals=[('Today',self.db.one('SELECT COALESCE(SUM(total),0) x FROM bills WHERE bill_date=?',(today,))['x']),('This Month',self.db.one('SELECT COALESCE(SUM(total),0) x FROM bills WHERE bill_date LIKE ?',(month+'%',))['x']),('All Time',self.db.one('SELECT COALESCE(SUM(total),0) x FROM bills')['x'])]
         for i,(a,b) in enumerate(vals):lf=tk.LabelFrame(cards,text=a,bg='white',fg='#64748b',padx=30,pady=15);lf.grid(row=0,column=i,sticky='ew',padx=5);cards.columnconfigure(i,weight=1);tk.Label(lf,text=f'₹{money(b):,.2f}',bg='white',fg='#2563eb',font=('Segoe UI',19,'bold')).pack()
-        tk.Label(self.content,text='Top Medicines by Quantity Sold',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',14,'bold')).pack(anchor='w',pady=(25,8));tv=ttk.Treeview(self.content,columns=('medicine','qty','sales'),show='headings');tv.pack(fill='both',expand=True);tv.heading('medicine',text='Medicine');tv.heading('qty',text='Units Sold');tv.heading('sales',text='Sales Value')
+        tk.Label(self.content,text='Top Medicines by Quantity Sold',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',14,'bold')).pack(anchor='w',pady=(25,8));rbox=tk.Frame(self.content,bg='white');rbox.pack(fill='both',expand=True);tv=ttk.Treeview(rbox,columns=('medicine','qty','sales'),show='headings');tv.pack(side='left',fill='both',expand=True);r_sb=ttk.Scrollbar(rbox,orient='vertical',command=tv.yview);r_sb.pack(side='right',fill='y');tv.configure(yscrollcommand=r_sb.set);tv.heading('medicine',text='Medicine');tv.heading('qty',text='Units Sold');tv.heading('sales',text='Sales Value')
         for r in self.db.q('SELECT name,SUM(qty) qty,SUM(amount) sales FROM bill_items GROUP BY name ORDER BY qty DESC LIMIT 20'):tv.insert('', 'end',values=(r['name'],r['qty'],f"₹{r['sales']:.2f}"))
     def users(self):
         if self.user['role'] not in ['Admin','Store Manager']:return
-        self.title('Users & Roles','One email ID has one role. Store Manager/Admin can assign or change roles.')
-        tv=ttk.Treeview(self.content,columns=('id','name','email','role','active'),show='headings');tv.pack(fill='both',expand=True,pady=8)
+        self.title('Users & Roles','One email ID has one role. The Store Manager assigns worker roles; Admin has full access but does not assign roles.')
+        tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True,pady=8);tv=ttk.Treeview(tvbox,columns=('id','name','email','role','active'),show='headings');tv.pack(side='left',fill='both',expand=True);u_sb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);u_sb.pack(side='right',fill='y');tv.configure(yscrollcommand=u_sb.set)
         for c,h in [('id','ID'),('name','Name'),('email','Email'),('role','Role'),('active','Active')]:tv.heading(c,text=h)
         for r in self.db.q('SELECT id,name,email,role,active FROM users ORDER BY id'):tv.insert('', 'end',iid=str(r['id']),values=tuple(r))
-        bar=tk.Frame(self.content,bg='#f8fafc');bar.pack(fill='x');role=tk.StringVar(value='Cashier');tk.Label(bar,text='Role for selected user',bg='#f8fafc').pack(side='left');ttk.Combobox(bar,textvariable=role,values=ROLES[1:],state='readonly',width=18).pack(side='left',padx=5);self.button(bar,'Assign Role',lambda:self.assign_role(tv,role),kind='primary').pack(side='left')
+        bar=tk.Frame(self.content,bg='#f8fafc');bar.pack(fill='x');role=tk.StringVar(value='Cashier');tk.Label(bar,text='Role for selected user',bg='#f8fafc').pack(side='left');ttk.Combobox(bar,textvariable=role,values=ROLES[1:],state='readonly',width=18).pack(side='left',padx=5);assign=self.button(bar,'Assign Role',lambda:self.assign_role(tv,role),kind='primary');assign.pack(side='left');
+        if self.user['role']!='Store Manager': assign.configure(state='disabled',bg='#94a3b8',cursor='arrow')
+        self.button(bar,'Reset Password',lambda:self.reset_user_password(tv),kind='warning').pack(side='left',padx=5); self.button(bar,'Activate / Deactivate',lambda:self.toggle_user(tv),kind='dark').pack(side='left',padx=5)
     def assign_role(self,tv,role):
-        s=tv.selection();
+        s=tv.selection()
+        if not s:return
+        uid=int(s[0]); r=self.db.one('SELECT * FROM users WHERE id=?',(uid,))
+        if not r:return
+        if uid==self.user['id']:
+            messagebox.showwarning('Users','Change your own credentials from My Account. You cannot change your own role here.'); return
+        if self.user['role']!='Store Manager':
+            messagebox.showerror('Access','Only the Store Manager can assign or change worker roles. Admin has full page access but does not assign roles.'); return
+        if r['role']=='Admin':
+            messagebox.showerror('Access','Admin role cannot be assigned or changed from this screen.'); return
+        self.db.conn.execute('UPDATE users SET role=? WHERE id=?',(role.get(),uid)); self.db.conn.commit(); self.users()
+
+    def reset_user_password(self,tv):
+        s=tv.selection()
+        if not s:return
+        uid=int(s[0]); r=self.db.one('SELECT * FROM users WHERE id=?',(uid,))
+        if not r:return
+        if r['role']=='Admin' and self.user['role']!='Admin': messagebox.showerror('Access','Only Admin can reset an Admin password.'); return
+        win=tk.Toplevel(self.root); win.title('Reset Worker Password'); win.geometry('430x300'); win.transient(self.root); win.grab_set(); frm=tk.Frame(win,bg='white',padx=25,pady=20); frm.pack(fill='both',expand=True)
+        tk.Label(frm,text=f'Reset password for {r["name"]}',bg='white',font=('Segoe UI',13,'bold')).pack(anchor='w',pady=(0,15))
+        e1=tk.Entry(frm,show='•',width=35);e2=tk.Entry(frm,show='•',width=35)
+        tk.Label(frm,text='New password',bg='white').pack(anchor='w',pady=3);e1.pack(fill='x',ipady=6)
+        tk.Label(frm,text='Confirm password',bg='white').pack(anchor='w',pady=8);e2.pack(fill='x',ipady=6)
+        def save():
+            if not strong_pw(e1.get()):messagebox.showerror('Validation','Password needs 8+ characters with uppercase, lowercase, number and special character.',parent=win);return
+            if e1.get()!=e2.get():messagebox.showerror('Validation','Passwords do not match.',parent=win);return
+            salt,d=hash_pw(e1.get());self.db.conn.execute('UPDATE users SET salt=?,password_hash=?,must_change=1 WHERE id=?',(salt,d,uid));self.db.conn.commit();win.destroy();messagebox.showinfo('Password reset','Password reset. The worker will be asked to change it at next login.')
+        self.button(frm,'Reset Password',save,kind='success').pack(anchor='w',pady=18)
+
+    def toggle_user(self,tv):
+        s=tv.selection()
         if not s:return
         uid=int(s[0]);r=self.db.one('SELECT * FROM users WHERE id=?',(uid,))
-        if r['role']=='Admin' and self.user['role']!='Admin':messagebox.showerror('Access','Only Admin can change an Admin role.');return
-        if uid==self.user['id'] and r['role']=='Admin':messagebox.showwarning('Users','You cannot remove your own Admin role here.');return
-        self.db.conn.execute('UPDATE users SET role=? WHERE id=?',(role.get(),uid));self.db.conn.commit();self.users()
+        if not r:return
+        if uid==self.user['id']:messagebox.showwarning('Users','You cannot deactivate your own account.');return
+        self.db.conn.execute('UPDATE users SET active=? WHERE id=?',(0 if r['active'] else 1,uid));self.db.conn.commit();self.users()
+
     def sms_outbox(self):
         self.title('SMS Outbox','Bills are saved even when SMS is unavailable. Send a queued SMS again after configuring your provider.')
-        tv=ttk.Treeview(self.content,columns=('invoice','phone','status','created','response'),show='headings');tv.pack(fill='both',expand=True)
+        tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True);tv=ttk.Treeview(tvbox,columns=('invoice','phone','status','created','response'),show='headings');tv.pack(side='left',fill='both',expand=True);sms_sb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);sms_sb.pack(side='right',fill='y');tv.configure(yscrollcommand=sms_sb.set)
         for c,h in [('invoice','Invoice'),('phone','Mobile'),('status','Status'),('created','Created'),('response','Provider Response')]:tv.heading(c,text=h)
         for r in self.db.q('SELECT b.invoice,o.phone,o.status,o.created_at,o.provider_response FROM sms_outbox o LEFT JOIN bills b ON b.id=o.bill_id ORDER BY o.id DESC'):tv.insert('', 'end',values=tuple(r))
     def settings(self):
@@ -552,6 +618,55 @@ class App:
         ok,resp=self.sms.send(phone,'MSG91 test message',invoice='TEST',customer_name='Customer',total=0)
         if ok: messagebox.showinfo('Test SMS','MSG91 accepted the test SMS.\n\n'+resp)
         else: messagebox.showerror('Test SMS','MSG91 did not accept the request.\n\n'+resp)
+
+    def account(self):
+        self.title('My Account','Change your name, email address and password. Each email ID belongs to one account.')
+        box=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0',padx=22,pady=22); box.pack(fill='x')
+        name=tk.StringVar(value=self.user['name']); email=tk.StringVar(value=self.user['email'])
+        tk.Label(box,text='Full name',bg='white',font=('Segoe UI',10,'bold')).grid(row=0,column=0,sticky='w',pady=8)
+        tk.Entry(box,textvariable=name,width=48,bd=1,relief='solid').grid(row=0,column=1,padx=15,ipady=6,sticky='w')
+        tk.Label(box,text='Email address',bg='white',font=('Segoe UI',10,'bold')).grid(row=1,column=0,sticky='w',pady=8)
+        tk.Entry(box,textvariable=email,width=48,bd=1,relief='solid').grid(row=1,column=1,padx=15,ipady=6,sticky='w')
+        tk.Label(box,text='Current password',bg='white',font=('Segoe UI',10,'bold')).grid(row=2,column=0,sticky='w',pady=8)
+        current=tk.Entry(box,show='•',width=48,bd=1,relief='solid'); current.grid(row=2,column=1,padx=15,ipady=6,sticky='w')
+        tk.Label(box,text='New password',bg='white',font=('Segoe UI',10,'bold')).grid(row=3,column=0,sticky='w',pady=8)
+        newpw=tk.Entry(box,show='•',width=48,bd=1,relief='solid'); newpw.grid(row=3,column=1,padx=15,ipady=6,sticky='w')
+        tk.Label(box,text='Confirm new password',bg='white',font=('Segoe UI',10,'bold')).grid(row=4,column=0,sticky='w',pady=8)
+        confirm=tk.Entry(box,show='•',width=48,bd=1,relief='solid'); confirm.grid(row=4,column=1,padx=15,ipady=6,sticky='w')
+        tk.Label(box,text=f'Current role: {self.user["role"]}',bg='white',fg='#64748b').grid(row=5,column=1,sticky='w',padx=15,pady=(5,12))
+        def save():
+            nm=name.get().strip(); em=email.get().strip().lower(); cp=current.get(); np=newpw.get(); cf=confirm.get()
+            if not nm or not valid_email(em): messagebox.showerror('Validation','Enter a valid name and email.'); return
+            row=self.db.one('SELECT * FROM users WHERE id=?',(self.user['id'],))
+            if not row or not verify_pw(cp,row['salt'],row['password_hash']): messagebox.showerror('Validation','Current password is incorrect.'); return
+            other=self.db.one('SELECT id FROM users WHERE lower(email)=? AND id<>?',(em,self.user['id']))
+            if other: messagebox.showerror('Validation','That email is already used by another account.'); return
+            salt,d=row['salt'],row['password_hash']
+            if np or cf:
+                if not strong_pw(np): messagebox.showerror('Validation','New password needs 8+ characters with uppercase, lowercase, number and special character.'); return
+                if np!=cf: messagebox.showerror('Validation','New passwords do not match.'); return
+                salt,d=hash_pw(np)
+            self.db.conn.execute('UPDATE users SET name=?,email=?,salt=?,password_hash=?,must_change=0 WHERE id=?',(nm,em,salt,d,self.user['id'])); self.db.conn.commit()
+            self.user=dict(self.db.one('SELECT * FROM users WHERE id=?',(self.user['id'],))); self.company=self.sms.s.get('company_name',self.company)
+            messagebox.showinfo('Account updated','Your account details have been updated.'); self.dashboard()
+        self.button(box,'Save Account Changes',save,kind='success').grid(row=6,column=1,sticky='w',padx=15,pady=12)
+
+    def after_login_change_credentials(self):
+        win=tk.Toplevel(self.root); win.title('Change Admin Credentials'); win.geometry('560x430'); win.transient(self.root); win.grab_set()
+        frm=tk.Frame(win,bg='white',padx=30,pady=25); frm.pack(fill='both',expand=True)
+        tk.Label(frm,text='First-time Admin setup',bg='white',fg='#0f172a',font=('Segoe UI',18,'bold')).pack(anchor='w')
+        tk.Label(frm,text='For security, change the default Admin password before using the shop.',bg='white',fg='#64748b',wraplength=470,justify='left').pack(anchor='w',pady=(5,18))
+        old=tk.Entry(frm,show='•',width=42); new=tk.Entry(frm,show='•',width=42); cf=tk.Entry(frm,show='•',width=42)
+        for label,e in [('Current password',old),('New password',new),('Confirm new password',cf)]:
+            tk.Label(frm,text=label,bg='white').pack(anchor='w',pady=(8,3)); e.pack(fill='x',ipady=6)
+        def save():
+            row=self.db.one('SELECT * FROM users WHERE id=?',(self.user['id'],))
+            if not verify_pw(old.get(),row['salt'],row['password_hash']): messagebox.showerror('Validation','Current password is incorrect.',parent=win); return
+            if not strong_pw(new.get()): messagebox.showerror('Validation','Password needs 8+ characters with uppercase, lowercase, number and special character.',parent=win); return
+            if new.get()!=cf.get(): messagebox.showerror('Validation','Passwords do not match.',parent=win); return
+            salt,d=hash_pw(new.get()); self.db.conn.execute('UPDATE users SET salt=?,password_hash=?,must_change=0 WHERE id=?',(salt,d,self.user['id'])); self.db.conn.commit(); self.user=dict(self.db.one('SELECT * FROM users WHERE id=?',(self.user['id'],))); win.destroy(); messagebox.showinfo('Security','Admin password changed successfully.')
+        self.button(frm,'Save New Password',save,kind='success').pack(anchor='w',pady=20)
+        win.protocol('WM_DELETE_WINDOW',lambda:(win.destroy()))
 
     def run(self):self.root.mainloop()
 
