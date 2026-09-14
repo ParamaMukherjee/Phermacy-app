@@ -153,6 +153,13 @@ class DB:
         icols={r['name'] for r in c.execute('PRAGMA table_info(bill_items)').fetchall()}
         for col,typ in [('molecule',"TEXT DEFAULT ''"),('expiry',"TEXT DEFAULT ''"),('mrp','REAL DEFAULT 0'),('manufacturer',"TEXT DEFAULT ''"),('pack',"TEXT DEFAULT ''"),('discount','REAL DEFAULT 0')]:
             if col not in icols: c.execute(f'ALTER TABLE bill_items ADD COLUMN {col} {typ}')
+        # Default application-owner credential for a fresh install.
+        # If an older build created the untouched first-login admin with the old
+        # demo password, migrate it once so the documented credential works.
+        old_admin=c.execute("SELECT * FROM users WHERE lower(email)=?",('admin@medibillwb.in',)).fetchone()
+        if old_admin and int(old_admin['must_change'] or 0)==1:
+            salt,d=hash_pw('Admin@1234')
+            c.execute("UPDATE users SET salt=?,password_hash=?,active=1,role='Admin' WHERE id=?",(salt,d,old_admin['id']))
         if not c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
             for name,email,pw,role in [('Administrator','admin@medibillwb.in','Admin@1234','Admin'),('Store Manager','store@medibillwb.in','Demo@1234','Store Manager'),('Cashier','cashier@medibillwb.in','Demo@1234','Cashier'),('Accounts','accounts@medibillwb.in','Demo@1234','Accounts')]:
                 salt,d=hash_pw(pw); c.execute('INSERT INTO users(name,email,user_id,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(name,email,email.split('@')[0],salt,d,role,1,1,1 if email=='admin@medibillwb.in' else 0,datetime.now().isoformat(timespec='seconds')))
@@ -289,7 +296,15 @@ class App:
         tk.Label(card,text='Password',bg='white',fg='#334155').pack(anchor='w',pady=(12,4)); p=tk.Entry(card,textvariable=pw,show='•',font=('Segoe UI',11),bd=1,relief='solid'); p.pack(fill='x',ipady=7)
         def go(event=None):
             login_id=email.get().strip().lower(); row=self.db.one('SELECT * FROM users WHERE (lower(email)=? OR lower(COALESCE(user_id,''))=?) AND active=1',(login_id,login_id))
-            if not row or not verify_pw(pw.get(),row['salt'],row['password_hash']): messagebox.showerror('Login failed','Invalid email or password.'); return
+            valid=bool(row and verify_pw(pw.get(),row['salt'],row['password_hash']))
+            # Repair an untouched first-login application-owner account from older builds.
+            if (not valid and row and row['role']=='Admin' and int(row['must_change'] or 0)==1
+                    and login_id in ('admin@medibillwb.in','admin') and pw.get() in ('Admin@1234','admin@1234')):
+                salt,d=hash_pw('Admin@1234')
+                self.db.conn.execute("UPDATE users SET salt=?,password_hash=?,active=1,role='Admin' WHERE id=?",(salt,d,row['id']))
+                self.db.conn.commit()
+                row=self.db.one('SELECT * FROM users WHERE id=?',(row['id'],)); valid=True
+            if not valid: messagebox.showerror('Login failed','Invalid email or password.'); return
             self.user=dict(row)
             self.dashboard()
             if int(self.user.get('must_change',0)):
@@ -590,7 +605,7 @@ class App:
         self.title('Inventory','Manage medicine stock. Cost is optional; MRP and Selling Price are used for billing.')
         top=tk.Frame(self.content,bg='#f8fafc');top.pack(fill='x',pady=(0,10))
         self.button(top,'Bulk Import Excel / CSV',self.bulk_import,kind='primary').pack(side='left')
-        self.button(top,'Print',self.print_inventory_pdf,kind='dark').pack(side='left',padx=7)
+        self.button(top,'Print Inventory PDF',self.print_inventory_pdf,kind='dark').pack(side='left',padx=7)
         tk.Label(top,text='Expected: Name, Molecule, Batch, Expiry, MRP, Selling Price, Cost, Stock, GST %, Supplier',bg='#f8fafc',fg='#64748b').pack(side='left',padx=12)
         form=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0',padx=14,pady=12);form.pack(fill='x')
         vars=[tk.StringVar() for _ in range(10)]
@@ -735,7 +750,7 @@ class App:
         cell=tk.Frame(f,bg='#eef2ff');cell.grid(row=0,column=5,sticky='w');self.date_entry(cell,self.sto,11)
         tk.Label(f,text='Payment',bg='#eef2ff',fg='#334155',font=('Segoe UI',9,'bold')).grid(row=1,column=0,sticky='w',padx=(0,4),pady=3)
         ttk.Combobox(f,textvariable=self.spay,values=['All','Cash','UPI','Card','Credit'],state='readonly',width=12).grid(row=1,column=1,sticky='w',padx=(0,8),pady=3)
-        self.button(f,'Export Excel',self.export_excel,kind='success').grid(row=1,column=2,sticky='w',padx=4,pady=3); self.button(f,'Print',self.print_sales_pdf,kind='dark').grid(row=1,column=3,columnspan=2,sticky='w',padx=4,pady=3)
+        self.button(f,'Export Excel',self.export_excel,kind='success').grid(row=1,column=2,sticky='w',padx=4,pady=3); self.button(f,'Print Sales PDF',self.print_sales_pdf,kind='dark').grid(row=1,column=3,columnspan=2,sticky='w',padx=4,pady=3)
         for v in [self.sf,self.sfrom,self.sto,self.spay]:v.trace_add('write',lambda *_:self.refresh_sales())
         tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True)
         self.sales_tv=ttk.Treeview(tvbox,columns=('invoice','date','time','customer','phone','payment','subtotal','gst','total','sms','saved_by'),show='headings');self.sales_tv.pack(side='left',fill='both',expand=True)
@@ -790,7 +805,7 @@ class App:
         ttk.Combobox(f,textvariable=self.rpay,values=['All','Cash','UPI','Card','Credit'],state='readonly',width=12).grid(row=1,column=1,sticky='w',padx=(0,8),pady=3)
         self.button(f,'Reset Filters',self.reset_reports,kind='dark').grid(row=1,column=2,columnspan=2,sticky='w',padx=4,pady=3)
         for v in [self.rf,self.rfrom,self.rto,self.rpay]:v.trace_add('write',lambda *_:self.refresh_reports())
-        report_actions=tk.Frame(self.content,bg='#f8fafc');report_actions.pack(fill='x',pady=(0,8)); self.button(report_actions,'Print',self.print_report_pdf,kind='dark').pack(side='left'); self.report_cards=tk.Frame(self.content,bg='#f8fafc');self.report_cards.pack(fill='x')
+        report_actions=tk.Frame(self.content,bg='#f8fafc');report_actions.pack(fill='x',pady=(0,8)); self.button(report_actions,'Print Report PDF',self.print_report_pdf,kind='dark').pack(side='left'); self.report_cards=tk.Frame(self.content,bg='#f8fafc');self.report_cards.pack(fill='x')
         tk.Label(self.content,text='Top Medicines by Quantity Sold',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',14,'bold')).pack(anchor='w',pady=(18,8))
         rbox=tk.Frame(self.content,bg='white');rbox.pack(fill='both',expand=True)
         self.report_tv=ttk.Treeview(rbox,columns=('medicine','qty','sales'),show='headings');self.report_tv.pack(side='left',fill='both',expand=True)
