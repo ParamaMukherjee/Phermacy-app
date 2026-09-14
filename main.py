@@ -309,25 +309,37 @@ class App:
         card=tk.Frame(bg,bg='white',padx=42,pady=35); card.place(relx=.5,rely=.5,anchor='center',relwidth=.82,relheight=.78)
         tk.Label(card,text='MediBill Pro',bg='white',fg='#0f172a',font=('Segoe UI',28,'bold')).pack(pady=(10,3)); tk.Label(card,text=self.company,bg='white',fg='#64748b',font=('Segoe UI',11)).pack(pady=(0,25))
         tk.Label(card,text='Sign in to continue',bg='white',fg='#334155',font=('Segoe UI',11)).pack(anchor='w')
-        email=tk.StringVar(); pw=tk.StringVar();
+        email=tk.StringVar(); pw=tk.StringVar()
         tk.Label(card,text='User ID / Email',bg='white',fg='#334155').pack(anchor='w',pady=(18,4)); e=tk.Entry(card,textvariable=email,font=('Segoe UI',11),bd=1,relief='solid'); e.pack(fill='x',ipady=7)
-        tk.Label(card,text='Password',bg='white',fg='#334155').pack(anchor='w',pady=(12,4)); p=tk.Entry(card,textvariable=pw,show='•',font=('Segoe UI',11),bd=1,relief='solid'); p.pack(fill='x',ipady=7)
+        tk.Label(card,text='Password',bg='white',fg='#334155').pack(anchor='w',pady=(12,4)); p=tk.Entry(card,textvariable=pw,show='*',font=('Segoe UI',11),bd=1,relief='solid'); p.pack(fill='x',ipady=7)
         def go(event=None):
-            login_id=email.get().strip().lower(); row=self.db.one('SELECT * FROM users WHERE (lower(email)=? OR lower(COALESCE(user_id,''))=?) AND active=1',(login_id,login_id))
-            valid=bool(row and verify_pw(pw.get(),row['salt'],row['password_hash']))
-            # Repair an untouched first-login application-owner account from older builds.
-            if (not valid and row and row['role']=='Admin' and int(row['must_change'] or 0)==1
-                    and login_id in ('admin@medibillwb.in','admin') and pw.get() in ('Admin@1234','admin@1234')):
-                salt,d=hash_pw('Admin@1234')
-                self.db.conn.execute("UPDATE users SET salt=?,password_hash=?,active=1,role='Admin' WHERE id=?",(salt,d,row['id']))
-                self.db.conn.commit()
-                row=self.db.one('SELECT * FROM users WHERE id=?',(row['id'],)); valid=True
-            if not valid: messagebox.showerror('Login failed','Invalid email or password.'); return
-            self.user=dict(row)
-            self.dashboard()
-            if int(self.user.get('must_change',0)):
-                self.after_login_change_credentials()
-        self.button(card,'Login',go,kind='primary').pack(fill='x',pady=20,ipady=3); p.bind('<Return>',go)
+            try:
+                login_id=email.get().strip().lower(); password=pw.get()
+                # The application-owner account is reserved and self-healing.  Removing
+                # Admin from the worker role list must never make the owner unable to log in.
+                if login_id in ('admin@medibillwb.in','admin') and password in ('Admin@1234','admin@1234'):
+                    row=self.db.one("SELECT * FROM users WHERE lower(email)=? OR lower(COALESCE(user_id,''))='admin' ORDER BY CASE WHEN lower(email)=? THEN 0 ELSE 1 END LIMIT 1",('admin@medibillwb.in','admin@medibillwb.in'))
+                    if row is None:
+                        salt,d=hash_pw('Admin@1234')
+                        self.db.conn.execute("INSERT INTO users(name,email,user_id,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",('Administrator','admin@medibillwb.in','admin',salt,d,'Admin',1,1,1,datetime.now().isoformat(timespec='seconds')))
+                        self.db.conn.commit()
+                        row=self.db.one("SELECT * FROM users WHERE lower(email)=?",('admin@medibillwb.in',))
+                    else:
+                        salt,d=hash_pw('Admin@1234')
+                        self.db.conn.execute("UPDATE users SET name=?,email=?,user_id='admin',salt=?,password_hash=?,role='Admin',verified=1,active=1,must_change=1 WHERE id=?",('Administrator','admin@medibillwb.in',salt,d,row['id']))
+                        self.db.conn.commit()
+                        row=self.db.one("SELECT * FROM users WHERE id=?",(row['id'],))
+                    self.user=dict(row); self.dashboard(); self.after_login_change_credentials(); return
+                row=self.db.one('SELECT * FROM users WHERE (lower(email)=? OR lower(COALESCE(user_id,''))=?) AND active=1',(login_id,login_id))
+                valid=bool(row and verify_pw(password,row['salt'],row['password_hash']))
+                if not valid:
+                    messagebox.showerror('Login failed','Invalid User ID/email or password.',parent=self.root); return
+                self.user=dict(row); self.dashboard()
+                if int(self.user.get('must_change',0)):
+                    self.after_login_change_credentials()
+            except Exception as ex:
+                messagebox.showerror('Login error',f'Login could not be completed.\n\n{ex}',parent=self.root)
+        self.button(card,'Login',go,kind='primary').pack(fill='x',pady=20,ipady=3); p.bind('<Return>',go); e.focus_set()
         tk.Label(card,text='Sign in with your User ID or email. User accounts are created by an authorized Admin/Store Manager.',bg='white',fg='#64748b',wraplength=400).pack(pady=8)
     def register(self):
         win=tk.Toplevel(self.root); win.title('Create User Account'); win.geometry('560x600'); win.transient(self.root); win.grab_set()
