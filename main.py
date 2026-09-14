@@ -153,16 +153,34 @@ class DB:
         icols={r['name'] for r in c.execute('PRAGMA table_info(bill_items)').fetchall()}
         for col,typ in [('molecule',"TEXT DEFAULT ''"),('expiry',"TEXT DEFAULT ''"),('mrp','REAL DEFAULT 0'),('manufacturer',"TEXT DEFAULT ''"),('pack',"TEXT DEFAULT ''"),('discount','REAL DEFAULT 0')]:
             if col not in icols: c.execute(f'ALTER TABLE bill_items ADD COLUMN {col} {typ}')
-        # Default application-owner credential for a fresh install.
-        # If an older build created the untouched first-login admin with the old
-        # demo password, migrate it once so the documented credential works.
-        old_admin=c.execute("SELECT * FROM users WHERE lower(email)=?",('admin@medibillwb.in',)).fetchone()
-        if old_admin and int(old_admin['must_change'] or 0)==1:
+        # The application-owner Admin account is a permanent built-in account.
+        # Removing 'Shop Owner/Admin' from assignment options must NEVER remove
+        # this account. Repair/create it if an older build deleted it.
+        owner_email='admin@medibillwb.in'
+        owner=c.execute("SELECT * FROM users WHERE lower(email)=? OR lower(COALESCE(user_id,''))='admin' LIMIT 1",(owner_email,)).fetchone()
+        if owner is None:
             salt,d=hash_pw('Admin@1234')
-            c.execute("UPDATE users SET salt=?,password_hash=?,active=1,role='Admin' WHERE id=?",(salt,d,old_admin['id']))
-        if not c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
-            for name,email,pw,role in [('Administrator','admin@medibillwb.in','Admin@1234','Admin'),('Store Manager','store@medibillwb.in','Demo@1234','Store Manager'),('Cashier','cashier@medibillwb.in','Demo@1234','Cashier'),('Accounts','accounts@medibillwb.in','Demo@1234','Accounts')]:
-                salt,d=hash_pw(pw); c.execute('INSERT INTO users(name,email,user_id,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(name,email,email.split('@')[0],salt,d,role,1,1,1 if email=='admin@medibillwb.in' else 0,datetime.now().isoformat(timespec='seconds')))
+            c.execute('INSERT INTO users(name,email,user_id,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                      ('Administrator',owner_email,'admin',salt,d,'Admin',1,1,1,datetime.now().isoformat(timespec='seconds')))
+        else:
+            # The owner account is always Admin and active. Never overwrite a
+            # password that the owner has already changed.
+            if owner['role'] != 'Admin' or not int(owner['active'] or 0):
+                c.execute("UPDATE users SET email=?,user_id='admin',role='Admin',active=1,verified=1 WHERE id=?",(owner_email,owner['id']))
+            if int(owner['must_change'] or 0)==1:
+                salt,d=hash_pw('Admin@1234')
+                c.execute("UPDATE users SET salt=?,password_hash=?,active=1,role='Admin',email=?,user_id='admin' WHERE id=?",(salt,d,owner_email,owner['id']))
+        # Any Admin account other than the fixed application-owner account is
+        # downgraded to Store Manager so nobody else can hold the Admin role.
+        c.execute("UPDATE users SET role='Store Manager' WHERE role='Admin' AND lower(email)<>?",(owner_email,))
+        if not c.execute('SELECT 1 FROM users WHERE lower(email)=?',(owner_email,)).fetchone():
+            salt,d=hash_pw('Admin@1234')
+            c.execute('INSERT INTO users(name,email,user_id,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                      ('Administrator',owner_email,'admin',salt,d,'Admin',1,1,1,datetime.now().isoformat(timespec='seconds')))
+        # Seed worker demo accounts only when they are missing.
+        for name,email,pw,role in [('Store Manager','store@medibillwb.in','Demo@1234','Store Manager'),('Cashier','cashier@medibillwb.in','Demo@1234','Cashier'),('Accounts','accounts@medibillwb.in','Demo@1234','Accounts')]:
+            if not c.execute('SELECT 1 FROM users WHERE lower(email)=?',(email,)).fetchone():
+                salt,d=hash_pw(pw); c.execute('INSERT INTO users(name,email,user_id,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(name,email,email.split('@')[0],salt,d,role,1,1,0,datetime.now().isoformat(timespec='seconds')))
         if not c.execute('SELECT 1 FROM medicines LIMIT 1').fetchone():
             meds=[('Paracetamol 500mg','Paracetamol','PCT001','2027-08-31',25,25,12,80,5,'Demo Supplier','Demo Pharma','10 tablets'),('Azithromycin 500mg','Azithromycin','AZI001','2027-03-31',85,85,48,25,5,'Demo Supplier','Demo Pharma','6 tablets'),('ORS Lemon','Oral Rehydration Salts','ORS001','2028-01-31',22,22,13,50,5,'Demo Supplier','Demo Pharma','21 g'),('Pantoprazole 40mg','Pantoprazole','PAN001','2027-11-30',60,60,30,35,12,'Demo Supplier','Demo Pharma','10 tablets'),('Vitamin C 500mg','Ascorbic Acid','VIT001','2026-11-30',35,35,20,7,12,'Demo Supplier','Demo Pharma','10 tablets'),('Cetirizine 10mg','Cetirizine','CET001','2026-10-15',18,18,9,15,5,'Demo Supplier','Demo Pharma','10 tablets')]
             c.executemany('INSERT INTO medicines(name,molecule,batch,expiry,price,mrp,cost,stock,gst,supplier,manufacturer,pack) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',meds)
@@ -321,7 +339,7 @@ class App:
             tk.Label(frm,text=label,bg='white',fg='#334155',font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(7,3))
             e=tk.Entry(frm,show='•' if show else '',font=('Segoe UI',10),bd=1,relief='solid'); e.pack(fill='x',ipady=6); fields.append(e)
         tk.Label(frm,text='Role',bg='white',fg='#334155',font=('Segoe UI',9,'bold')).pack(anchor='w',pady=(9,3))
-        role=tk.StringVar(value='Cashier'); ttk.Combobox(frm,textvariable=role,values=['Shop Owner (Admin)','Store Manager','Cashier','Accounts'],state='readonly').pack(fill='x',ipady=3)
+        role=tk.StringVar(value='Cashier'); ttk.Combobox(frm,textvariable=role,values=['Store Manager','Cashier','Accounts'],state='readonly').pack(fill='x',ipady=3)
         def save():
             uid,name,email,p1,p2=[x.get().strip() for x in fields]; email=email.lower()
             if not re.fullmatch(r'[A-Za-z0-9_.-]{3,40}',uid): messagebox.showerror('Validation','User ID must be 3-40 characters and use only letters, numbers, dot, underscore or hyphen.',parent=win); return
@@ -332,7 +350,7 @@ class App:
             if self.db.one('SELECT 1 FROM users WHERE lower(user_id)=?',(uid.lower(),)): messagebox.showerror('Validation','This User ID already exists.',parent=win); return
             if email and self.db.one('SELECT 1 FROM users WHERE lower(email)=?',(email,)): messagebox.showerror('Validation','This email already has an account.',parent=win); return
             if not email: email=f'{uid.lower()}@local.medibill'
-            internal='Admin' if role.get().startswith('Shop Owner') else role.get()
+            internal=role.get()
             salt,d=hash_pw(p1)
             self.db.conn.execute('INSERT INTO users(name,email,user_id,salt,password_hash,role,verified,active,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(name,email,uid,salt,d,internal,1,1,0,datetime.now().isoformat(timespec='seconds')))
             new_id=self.db.conn.execute('SELECT last_insert_rowid()').fetchone()[0]; self.db.audit('User',new_id,'Account created',f'User ID {uid}; role {internal}',self.user['email'] if self.user else 'System'); self.db.conn.commit(); win.destroy(); messagebox.showinfo('Created',f'Account {uid} created successfully.')
