@@ -452,25 +452,28 @@ class App:
         self.title('Billing','Add medicines, adjust quantities, generate the bill, and send SMS only when you choose.')
         self.b_name=tk.StringVar(); self.b_phone=tk.StringVar(); self.b_address=tk.StringVar(); self.b_doctor=tk.StringVar(); self.b_doctor_reg=tk.StringVar(); self.b_payment=tk.StringVar(value='Cash'); self.b_search=tk.StringVar(); self.search_after=None
         info=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0',padx=15,pady=12); info.pack(fill='x')
-        fields=[('Customer name',self.b_name,27),('Mobile number',self.b_phone,20),('Customer address',self.b_address,30),('Doctor name',self.b_doctor,22),('Doctor Reg. No.',self.b_doctor_reg,18)]
+        fields=[('Customer name',self.b_name,27),('Mobile number',self.b_phone,20),('Customer address',self.b_address,30),('Doctor name',self.b_doctor,22),('Doctor Reg. No.',self.b_doctor_reg,18),('Payment method',self.b_payment,14)]
+        for col in range(3): info.columnconfigure(col,weight=1)
         for i,(lab,var,w) in enumerate(fields):
-            tk.Label(info,text=lab,bg='white',fg='#475569').grid(row=0,column=i,sticky='w',padx=5); tk.Entry(info,textvariable=var,width=w,bd=1,relief='solid').grid(row=1,column=i,padx=5,ipady=6,sticky='ew')
-        tk.Label(info,text='Payment method',bg='white',fg='#475569').grid(row=0,column=5,sticky='w',padx=5); ttk.Combobox(info,textvariable=self.b_payment,values=['Cash','UPI','Card','Credit'],state='readonly',width=14).grid(row=1,column=5,padx=5,sticky='w')
-        self.button(info,'Save Customer',self.save_current_customer,kind='primary').grid(row=2,column=0,columnspan=2,sticky='w',padx=5,pady=(10,0))
-        tk.Label(info,text='Customer details are automatically saved/updated when a bill is generated. Use this button to save before billing.',bg='white',fg='#64748b',font=('Segoe UI',8)).grid(row=2,column=2,columnspan=4,sticky='w',padx=5,pady=(10,0))
+            col=i%3; row=(i//3)*2
+            tk.Label(info,text=lab,bg='white',fg='#475569').grid(row=row,column=col,sticky='w',padx=5,pady=(0,3))
+            if lab=='Payment method': ttk.Combobox(info,textvariable=var,values=['Cash','UPI','Card','Credit'],state='readonly',width=w).grid(row=row+1,column=col,padx=5,pady=(0,5),sticky='ew')
+            else: tk.Entry(info,textvariable=var,width=w,bd=1,relief='solid').grid(row=row+1,column=col,padx=5,pady=(0,5),ipady=6,sticky='ew')
         tk.Label(self.content,text='Find medicine',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',13,'bold')).pack(anchor='w',pady=(18,6)); sf=tk.Frame(self.content,bg='#f8fafc'); sf.pack(fill='x'); search=tk.Entry(sf,textvariable=self.b_search,font=('Segoe UI',11),bd=1,relief='solid'); search.pack(side='left',fill='x',expand=True,ipady=7); tk.Label(sf,text='  Type to search instantly',bg='#f8fafc',fg='#64748b').pack(side='left')
         results_box=tk.Frame(self.content,bg='#f8fafc'); results_box.pack(fill='x',pady=8)
-        self.bill_results=ttk.Treeview(results_box,columns=('id','name','molecule','batch','expiry','mrp','price','stock'),show='headings',height=5); self.bill_results.pack(side='left',fill='both',expand=True)
-        rsb=ttk.Scrollbar(results_box,orient='vertical',command=self.bill_results.yview); rsb.pack(side='right',fill='y'); r_hsb=ttk.Scrollbar(self.content,orient='horizontal',command=self.bill_results.xview); r_hsb.pack(fill='x'); self.bill_results.configure(yscrollcommand=rsb.set,xscrollcommand=r_hsb.set)
+        self.bill_results=ttk.Treeview(results_box,columns=('id','name','molecule','batch','expiry','mrp','price','stock'),show='headings',height=5,selectmode='browse'); self.bill_results.pack(side='left',fill='both',expand=True)
+        self.bill_results.configure()
         for c,h in [('id','ID'),('name','Medicine'),('molecule','Molecule'),('batch','Batch'),('expiry','Expiry'),('mrp','MRP'),('price','Selling Price'),('stock','Available')]: self.bill_results.heading(c,text=h)
+        for c,w in {'id':45,'name':150,'molecule':110,'batch':80,'expiry':80,'mrp':70,'price':90,'stock':70}.items(): self.bill_results.column(c,width=w,minwidth=45,stretch=c in ('name','molecule'))
         self.bill_results.bind('<Double-1>',lambda e:self.add_selected()); self.bill_results.bind('<Return>',lambda e:self.add_selected()); self.bill_search()
         tk.Label(self.content,text='Bill items',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',13,'bold')).pack(anchor='w',pady=(10,6))
         cartbox=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0'); cartbox.pack(fill='x',expand=False)
         cart_table=tk.Frame(cartbox,bg='white'); cart_table.pack(fill='x',expand=False)
-        self.cart_tv=ttk.Treeview(cart_table,columns=('name','batch','qty','mrp','price','gst','discount','amount'),show='headings',height=5); self.cart_tv.pack(side='left',fill='both',expand=True)
+        self.cart_tv=ttk.Treeview(cart_table,columns=('name','batch','qty','mrp','price','gst','discount','amount'),show='headings',height=5,selectmode='browse'); self.cart_tv.pack(side='left',fill='both',expand=True)
         cart_sb=ttk.Scrollbar(cart_table,orient='vertical',command=self.cart_tv.yview); cart_sb.pack(side='right',fill='y'); cart_hsb=ttk.Scrollbar(cartbox,orient='horizontal',command=self.cart_tv.xview); cart_hsb.pack(side='bottom',fill='x'); self.cart_tv.configure(yscrollcommand=cart_sb.set,xscrollcommand=cart_hsb.set)
         
         for c,h in [('name','Medicine'),('batch','Batch'),('qty','Quantity'),('mrp','MRP'),('price','Selling Price'),('gst','GST %'),('discount','Disc.'),('amount','Amount')]: self.cart_tv.heading(c,text=h)
+        for c,w in {'name':180,'batch':90,'qty':75,'mrp':75,'price':95,'gst':65,'discount':65,'amount':95}.items(): self.cart_tv.column(c,width=w,minwidth=55,stretch=c in ('name','price'))
         self.cart_tv.bind('<Double-1>',lambda e:self.edit_cart_qty()); self.cart_tv.bind('<Delete>',lambda e:self.remove_cart())
         actions=tk.Frame(self.content,bg='#e2e8f0',highlightthickness=1,highlightbackground='#cbd5e1'); actions.pack(fill='x',pady=(8,5),ipady=4)
         tk.Label(actions,text='Selected item:',bg='#e2e8f0',fg='#475569',font=('Segoe UI',9,'bold')).pack(side='left',padx=(8,5))
@@ -480,7 +483,7 @@ class App:
         self.button(actions,'Clear Bill',self.clear_bill,kind='dark').pack(side='left',padx=3)
         tk.Label(actions,text='Tip: select a row, then use + / − or Delete. Double-click quantity to edit.',bg='#e2e8f0',fg='#64748b').pack(side='right',padx=8)
         foot=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#cbd5e1'); foot.pack(fill='x',pady=(2,0),ipady=5); self.total_lbl=tk.Label(foot,text='Total: ₹0.00',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',20,'bold')); self.total_lbl.pack(side='left',pady=8)
-        self.generate_btn=self.button(foot,'Generate Bill',self.checkout,kind='success'); self.generate_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.sms_btn=self.button(foot,'Send SMS',self.send_last_sms,kind='primary'); self.sms_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.pdf_btn=self.button(foot,'Print / Save PDF',self.generate_last_pdf,kind='dark'); self.pdf_btn.pack(side='right',padx=4,ipadx=8,ipady=5); self.sms_btn.configure(state='disabled'); self.pdf_btn.configure(state='disabled')
+        self.generate_btn=self.button(foot,'Generate Bill',self.checkout,kind='success'); self.generate_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.sms_btn=self.button(foot,'Send SMS',self.send_last_sms,kind='primary'); self.sms_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.pdf_btn=self.button(foot,'Print',self.generate_last_pdf,kind='dark'); self.pdf_btn.pack(side='right',padx=4,ipadx=8,ipady=5); self.sms_btn.configure(state='disabled'); self.pdf_btn.configure(state='disabled')
         self.b_search.trace_add('write',lambda *_:self.bill_search()); search.focus_set()
     def bill_search(self):
         if not hasattr(self,'bill_results'): return
@@ -569,8 +572,11 @@ class App:
             self.db.conn.commit()
         except Exception as e:self.db.conn.rollback();messagebox.showerror('Could not generate bill',str(e));return
         self.last_invoice=invoice;self.last_bill_id=bid;self.last_bill={'invoice':invoice,'date':now.strftime('%Y-%m-%d'),'time':now.strftime('%H:%M:%S'),'name':name,'phone':phone,'address':self.b_address.get().strip(),'doctor':self.b_doctor.get().strip(),'doctor_reg':self.b_doctor_reg.get().strip(),'payment':self.b_payment.get(),'subtotal':money(subtotal),'gst':money(gsttotal),'total':money(total),'items':[dict(x) for x in self.cart]}
-        self.cart.clear();self.refresh_cart();self.bill_search();self.pdf_btn.configure(state='normal');self.sms_btn.configure(state='normal' if phone else 'disabled');
-        messagebox.showinfo('Bill generated',f'Invoice: {invoice}\nTotal: ₹{total:,.2f}\nCustomer saved: {"Yes" if phone else "No mobile supplied"}\n\nChoose “Print / Save PDF” or “Send SMS” separately.')
+        self.cart.clear();self.refresh_cart();self.bill_search();
+        # Persisted bill/customer data is committed above; refresh Sales immediately so the new sale is visible without reopening the page.
+        if hasattr(self,'sales_tv'): self.refresh_sales()
+        self.pdf_btn.configure(state='normal');self.sms_btn.configure(state='normal' if phone else 'disabled');
+        messagebox.showinfo('Bill generated',f'Invoice: {invoice}\nTotal: ₹{total:,.2f}\nCustomer updated automatically: {"Yes" if phone else "No mobile supplied"}\n\nChoose “Print” or “Send SMS” separately.')
     def send_last_sms(self):
         if not self.last_bill or not self.last_bill.get('phone'):messagebox.showwarning('SMS','No customer mobile number is available for this bill.');return
         ok,resp=self.sms.send(self.last_bill['phone'],self.sms_message(self.last_bill['invoice'],self.last_bill['name'],self.last_bill['total']),invoice=self.last_bill['invoice'],customer_name=self.last_bill['name'],total=self.last_bill['total']);status='Sent' if ok else 'Queued';self.db.conn.execute('UPDATE bills SET sms_status=? WHERE id=?',(status,self.last_bill_id));self.db.conn.execute('UPDATE sms_outbox SET status=?,provider_response=? WHERE bill_id=?',(status,resp,self.last_bill_id));self.db.audit('SMS',self.last_bill_id,'Send attempted',status,self.user['email']);self.db.conn.commit();messagebox.showinfo('SMS',('SMS sent successfully.' if ok else 'SMS could not be sent; it remains in the local SMS Outbox.')+f'\n\n{resp}')
@@ -635,7 +641,7 @@ class App:
         self.title('Inventory','Manage medicine stock. Cost is optional; MRP and Selling Price are used for billing.')
         top=tk.Frame(self.content,bg='#f8fafc');top.pack(fill='x',pady=(0,10))
         self.button(top,'Bulk Import Excel / CSV',self.bulk_import,kind='primary').pack(side='left')
-        self.button(top,'Print Inventory PDF',self.print_inventory_pdf,kind='dark').pack(side='left',padx=7)
+        self.button(top,'Print',self.print_inventory_pdf,kind='dark').pack(side='left',padx=7)
         tk.Label(top,text='Expected: Name, Molecule, Batch, Expiry, MRP, Selling Price, Cost, Stock, GST %, Supplier',bg='#f8fafc',fg='#64748b').pack(side='left',padx=12)
         form=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0',padx=14,pady=12);form.pack(fill='x')
         vars=[tk.StringVar() for _ in range(10)]
@@ -661,20 +667,56 @@ class App:
             except Exception as e:messagebox.showerror('Inventory','Please check the medicine fields.\n\n'+str(e))
         self.button(form,'+ Add Medicine',add,kind='success').grid(row=4,column=0,columnspan=5,padx=7,pady=(4,2),sticky='w')
         tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True,pady=10)
-        tv=ttk.Treeview(tvbox,columns=('id','name','molecule','batch','expiry','mrp','price','stock','gst','supplier','saved_by'),show='headings');tv.pack(side='left',fill='both',expand=True)
-        vsb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);vsb.pack(side='right',fill='y');hsb=ttk.Scrollbar(self.content,orient='horizontal',command=tv.xview);hsb.pack(fill='x');tv.configure(yscrollcommand=vsb.set,xscrollcommand=hsb.set); self._bind_tree_scroll(tv)
+        tv=ttk.Treeview(tvbox,columns=('id','name','molecule','batch','expiry','mrp','price','stock','gst','supplier','saved_by'),show='headings',selectmode='extended');tv.pack(side='left',fill='both',expand=True)
+        vsb=ttk.Scrollbar(tvbox,orient='vertical',command=tv.yview);vsb.pack(side='right',fill='y');tv.configure(yscrollcommand=vsb.set); self._bind_tree_scroll(tv)
         for c,h in [('id','ID'),('name','Medicine'),('molecule','Molecule'),('batch','Batch'),('expiry','Expiry'),('mrp','MRP'),('price','Selling Price'),('stock','Stock'),('gst','GST %'),('supplier','Supplier'),('saved_by','Saved / Updated By')]:tv.heading(c,text=h)
+        inv_widths={'id':45,'name':150,'molecule':125,'batch':90,'expiry':90,'mrp':75,'price':90,'stock':65,'gst':60,'supplier':120,'saved_by':135}
+        for c,w in inv_widths.items(): tv.column(c,width=w,minwidth=45,stretch=True if c in ('name','molecule','supplier','saved_by') else False)
         def refresh():
             for x in tv.get_children():tv.delete(x)
             for r in self.db.q("SELECT id,name,molecule,batch,expiry,mrp,price,stock,gst,supplier,COALESCE(NULLIF(updated_by,''),NULLIF(created_by,''),'Legacy/System') AS saved_by FROM medicines ORDER BY name"):tv.insert('', 'end',iid=str(r['id']),values=(r['id'],r['name'],r['molecule'],r['batch'],fmt_date(r['expiry']),f'₹{r["mrp"]:.2f}',f'₹{r["price"]:.2f}',r['stock'],r['gst'],r['supplier'],r['saved_by']))
         def delete_selected():
-            sel=tv.selection()
-            if not sel: messagebox.showwarning('Inventory','Select an inventory entry first.');return
-            mid=int(sel[0]);r=self.db.one('SELECT * FROM medicines WHERE id=?',(mid,))
-            if not r:return
-            if not messagebox.askyesno('Delete inventory entry',f'Delete {r["name"]} / Batch {r["batch"]}?\n\nHistorical bills will be kept, but this inventory entry will be removed.'):return
-            self.db.conn.execute('UPDATE bill_items SET medicine_id=NULL WHERE medicine_id=?',(mid,));self.db.conn.execute('DELETE FROM medicines WHERE id=?',(mid,));self.db.audit('Medicine',mid,'Deleted',f'{r["name"]}; batch {r["batch"]}',self.user['email']);self.db.conn.commit();refresh()
-        actions=tk.Frame(self.content,bg='#f8fafc');actions.pack(fill='x',pady=(0,10));self.button(actions,'Delete Selected Entry',delete_selected,kind='danger').pack(side='left')
+            sel=list(tv.selection())
+            if not sel:
+                messagebox.showwarning('Inventory','Select one or more inventory entries first.')
+                return
+            rows=[self.db.one('SELECT * FROM medicines WHERE id=?',(int(i),)) for i in sel]
+            rows=[r for r in rows if r]
+            if not rows:return
+            count=len(rows)
+            if not messagebox.askyesno('Delete inventory entries',f'Delete {count} selected inventory entr{"y" if count==1 else "ies"}?\n\nHistorical bills will be kept, but these inventory entries will be removed.'):
+                return
+            try:
+                self.db.conn.execute('BEGIN')
+                for r in rows:
+                    mid=int(r['id'])
+                    self.db.conn.execute('UPDATE bill_items SET medicine_id=NULL WHERE medicine_id=?',(mid,))
+                    self.db.conn.execute('DELETE FROM medicines WHERE id=?',(mid,))
+                    self.db.audit('Medicine',mid,'Deleted',f'{r["name"]}; batch {r["batch"]}',self.user['email'])
+                self.db.conn.commit()
+                refresh()
+                messagebox.showinfo('Inventory',f'{count} inventory entr{"y" if count==1 else "ies"} deleted successfully.')
+            except Exception as e:
+                self.db.conn.rollback(); messagebox.showerror('Inventory','Could not delete selected entries.\n\n'+str(e))
+        def select_to_end(event=None):
+            items=tv.get_children()
+            if not items:return 'break'
+            focus=tv.focus()
+            if not focus:return 'break'
+            try:start_idx=items.index(focus)
+            except ValueError:return 'break'
+            tv.selection_set(items[start_idx:])
+            tv.focus(items[-1])
+            tv.see(items[-1])
+            return 'break'
+        def select_all(event=None):
+            tv.selection_set(tv.get_children())
+            return 'break'
+        tv.bind('<Control-Shift-Down>',select_to_end)
+        tv.bind('<Control-Shift-Key-Down>',select_to_end)
+        tv.bind('<Control-a>',select_all)
+        tv.bind('<Control-A>',select_all)
+        actions=tk.Frame(self.content,bg='#f8fafc');actions.pack(fill='x',pady=(0,10));self.button(actions,'Delete Selected Entry',delete_selected,kind='danger').pack(side='left'); tk.Label(actions,text='Tip: Ctrl+Shift+↓ selects from the current row to the bottom • Ctrl+A selects all • Shift-click selects a range',bg='#f8fafc',fg='#64748b').pack(side='left',padx=12)
         refresh()
 
     def bulk_import(self):
@@ -780,14 +822,14 @@ class App:
         cell=tk.Frame(f,bg='#eef2ff');cell.grid(row=0,column=5,sticky='w');self.date_entry(cell,self.sto,11)
         tk.Label(f,text='Payment',bg='#eef2ff',fg='#334155',font=('Segoe UI',9,'bold')).grid(row=1,column=0,sticky='w',padx=(0,4),pady=3)
         ttk.Combobox(f,textvariable=self.spay,values=['All','Cash','UPI','Card','Credit'],state='readonly',width=12).grid(row=1,column=1,sticky='w',padx=(0,8),pady=3)
-        self.button(f,'Export Excel',self.export_excel,kind='success').grid(row=1,column=2,sticky='w',padx=4,pady=3); self.button(f,'Print Sales PDF',self.print_sales_pdf,kind='dark').grid(row=1,column=3,columnspan=2,sticky='w',padx=4,pady=3)
+        self.button(f,'Export Excel',self.export_excel,kind='success').grid(row=1,column=2,sticky='w',padx=4,pady=3); self.button(f,'Print',self.print_sales_pdf,kind='dark').grid(row=1,column=3,columnspan=2,sticky='w',padx=4,pady=3)
         for v in [self.sf,self.sfrom,self.sto,self.spay]:v.trace_add('write',lambda *_:self.refresh_sales())
         tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True)
         self.sales_tv=ttk.Treeview(tvbox,columns=('invoice','date','time','customer','phone','payment','subtotal','gst','total','sms','saved_by'),show='headings');self.sales_tv.pack(side='left',fill='both',expand=True)
         vsb=ttk.Scrollbar(tvbox,orient='vertical',command=self.sales_tv.yview);vsb.pack(side='right',fill='y')
-        hsb=ttk.Scrollbar(self.content,orient='horizontal',command=self.sales_tv.xview);hsb.pack(fill='x',pady=(0,6));self.sales_tv.configure(yscrollcommand=vsb.set,xscrollcommand=hsb.set); self._bind_tree_scroll(tv)
-        headers=[('invoice','Invoice',190),('date','Date',100),('time','Time',85),('customer','Customer',170),('phone','Mobile',120),('payment','Payment',90),('subtotal','Taxable',95),('gst','GST',80),('total','Total',95),('sms','SMS',110)]
-        for c,h,w in headers:self.sales_tv.heading(c,text=h);self.sales_tv.column(c,width=w,minwidth=70,stretch=False)
+        self.sales_tv.configure(yscrollcommand=vsb.set); self._bind_tree_scroll(self.sales_tv)
+        headers=[('invoice','Invoice',155),('date','Date',85),('time','Time',75),('customer','Customer',145),('phone','Mobile',105),('payment','Payment',80),('subtotal','Taxable',85),('gst','GST',70),('total','Total',85),('sms','SMS',85),('saved_by','Saved By',110)]
+        for c,h,w in headers:self.sales_tv.heading(c,text=h);self.sales_tv.column(c,width=w,minwidth=55,stretch=c in ('invoice','customer','saved_by'))
         self.sales_tv.bind('<Double-1>',lambda e:self.open_selected_bill_pdf());self.refresh_sales()
 
     def sales_rows(self):
@@ -835,7 +877,7 @@ class App:
         ttk.Combobox(f,textvariable=self.rpay,values=['All','Cash','UPI','Card','Credit'],state='readonly',width=12).grid(row=1,column=1,sticky='w',padx=(0,8),pady=3)
         self.button(f,'Reset Filters',self.reset_reports,kind='dark').grid(row=1,column=2,columnspan=2,sticky='w',padx=4,pady=3)
         for v in [self.rf,self.rfrom,self.rto,self.rpay]:v.trace_add('write',lambda *_:self.refresh_reports())
-        report_actions=tk.Frame(self.content,bg='#f8fafc');report_actions.pack(fill='x',pady=(0,8)); self.button(report_actions,'Print Report PDF',self.print_report_pdf,kind='dark').pack(side='left'); self.report_cards=tk.Frame(self.content,bg='#f8fafc');self.report_cards.pack(fill='x')
+        report_actions=tk.Frame(self.content,bg='#f8fafc');report_actions.pack(fill='x',pady=(0,8)); self.button(report_actions,'Print',self.print_report_pdf,kind='dark').pack(side='left'); self.report_cards=tk.Frame(self.content,bg='#f8fafc');self.report_cards.pack(fill='x')
         tk.Label(self.content,text='Top Medicines by Quantity Sold',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',14,'bold')).pack(anchor='w',pady=(18,8))
         rbox=tk.Frame(self.content,bg='white');rbox.pack(fill='both',expand=True)
         self.report_tv=ttk.Treeview(rbox,columns=('medicine','qty','sales'),show='headings');self.report_tv.pack(side='left',fill='both',expand=True)
