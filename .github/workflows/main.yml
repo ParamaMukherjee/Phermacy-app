@@ -13,18 +13,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
+      - name: Install Python dependencies
         shell: cmd
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
+      - name: Download bundled OCR engine
+        shell: powershell
+        run: |
+          $url = "https://github.com/tesseract-ocr/tesseract/releases/download/5.5.3/tesseract-ocr-w64-setup-5.5.3.20260724.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\tesseract.exe"
+          $dest = "$pwd\tessbundle"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Start-Process -FilePath "$env:RUNNER_TEMP\tesseract.exe" -ArgumentList "/S", "/D=$dest" -Wait -NoNewWindow
+          if (!(Test-Path "$dest\tesseract.exe")) { throw "Tesseract bundle was not installed." }
       - name: Build
         shell: cmd
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MediBill main.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MediBill --add-data "tessbundle;tesseract" main.py
       - name: Verify
         shell: powershell
-        run: if (!(Test-Path "dist\\MediBill.exe")) { throw "MediBill.exe was not created." }
+        run: |
+          if (!(Test-Path "dist\MediBill.exe")) { throw "MediBill.exe was not created." }
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
