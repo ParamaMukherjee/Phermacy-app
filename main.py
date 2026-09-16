@@ -330,7 +330,10 @@ class App:
                         self.db.conn.commit()
                         row=self.db.one("SELECT * FROM users WHERE id=?",(row['id'],))
                     self.user=dict(row); self.dashboard(); self.after_login_change_credentials(); return
-                row=self.db.one('SELECT * FROM users WHERE (lower(email)=? OR lower(COALESCE(user_id,''))=?) AND active=1',(login_id,login_id))
+                # Keep worker login SQL deliberately simple for compatibility with
+                # SQLite databases created by older builds. Normalize the entered ID
+                # in Python instead of relying on nested SQL functions.
+                row=self.db.one('SELECT * FROM users WHERE active=1 AND (email=? COLLATE NOCASE OR user_id=? COLLATE NOCASE) LIMIT 1',(login_id,login_id))
                 valid=bool(row and verify_pw(password,row['salt'],row['password_hash']))
                 if not valid:
                     messagebox.showerror('Login failed','Invalid User ID/email or password.',parent=self.root); return
@@ -398,6 +401,8 @@ class App:
     def dashboard_home(self):
         self.title('Dashboard','Live pharmacy overview. Filter the status list by date, status or medicine name.')
         today=datetime.now().strftime('%Y-%m-%d')
+        # Build the dashboard UI once. Filter changes refresh only the data, so the
+        # search Entry is never destroyed/recreated while the user is typing.
         self.dash_date=getattr(self,'dash_date',tk.StringVar(value=today))
         self.dash_status=getattr(self,'dash_status',tk.StringVar(value='All'))
         self.dash_search=getattr(self,'dash_search',tk.StringVar())
@@ -412,20 +417,38 @@ class App:
         self.button(filters,'Reset Filters',lambda:self.reset_dashboard_filters(),kind='dark').pack(side='left',padx=8)
 
         stats=tk.Frame(self.content,bg='#f8fafc'); stats.pack(fill='x')
-        selected=self.dash_date.get().strip() or today
-        vals=[('Sales',self.db.one('SELECT COALESCE(SUM(total),0) x FROM bills WHERE bill_date=?',(selected,))['x'],'#2563eb'),('Bills',self.db.one('SELECT COUNT(*) x FROM bills WHERE bill_date=?',(selected,))['x'],'#7c3aed'),('Customers',self.db.one('SELECT COUNT(*) x FROM customers')['x'],'#0891b2'),('Medicines',self.db.one('SELECT COUNT(*) x FROM medicines')['x'],'#16a34a')]
-        for i,(label,val,accent) in enumerate(vals):
-            c=tk.Frame(stats,bg='white',highlightthickness=1,highlightbackground='#e2e8f0'); c.grid(row=0,column=i,sticky='ew',padx=5); stats.columnconfigure(i,weight=1)
-            tk.Label(c,text=f"{label} — {fmt_date(selected)}",bg='white',fg='#64748b',font=('Segoe UI',9)).pack(anchor='w',padx=15,pady=(12,2))
-            tk.Label(c,text=f'₹{money(val):,.2f}' if label=='Sales' else str(val),bg='white',fg=accent,font=('Segoe UI',19,'bold')).pack(anchor='w',padx=15,pady=(0,11))
+        self.dash_stats=stats
+        for i in range(4): stats.columnconfigure(i,weight=1)
 
         tk.Label(self.content,text='Medicine Status',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',16,'bold')).pack(anchor='w',pady=(18,8))
         table=tk.Frame(self.content,bg='white'); table.pack(fill='both',expand=True)
-        tv=ttk.Treeview(table,columns=('name','batch','stock','expiry','status'),show='headings');tv.pack(side='left',fill='both',expand=True)
-        sb=ttk.Scrollbar(table,orient='vertical',command=tv.yview);sb.pack(side='right',fill='y'); dash_hsb=ttk.Scrollbar(self.content,orient='horizontal',command=tv.xview);dash_hsb.pack(fill='x');tv.configure(yscrollcommand=sb.set,xscrollcommand=dash_hsb.set)
+        tv=ttk.Treeview(table,columns=('name','batch','stock','expiry','status'),show='headings')
+        tv.pack(side='left',fill='both',expand=True)
+        sb=ttk.Scrollbar(table,orient='vertical',command=tv.yview);sb.pack(side='right',fill='y');tv.configure(yscrollcommand=sb.set)
         for c,h in [('name','Medicine'),('batch','Batch'),('stock','Stock'),('expiry','Expiry'),('status','Status')]: tv.heading(c,text=h)
         tv.column('name',width=280,minwidth=150,stretch=True);tv.column('batch',width=120,minwidth=90,stretch=True);tv.column('stock',width=90,minwidth=70,stretch=False);tv.column('expiry',width=120,minwidth=100,stretch=False);tv.column('status',width=130,minwidth=110,stretch=False)
         tv.tag_configure('near',foreground='#dc2626');tv.tag_configure('expired',foreground='#991b1b');tv.tag_configure('low',foreground='#d97706');tv.tag_configure('instock',foreground='#15803d')
+        self.dash_tv=tv
+
+        # Search refreshes in place; focus/cursor stays in the Entry.
+        search.bind('<KeyRelease>',lambda e:self.refresh_dashboard_data())
+        status_box.bind('<<ComboboxSelected>>',lambda e:self.refresh_dashboard_data())
+        self.dash_date.trace_add('write',lambda *_: self.refresh_dashboard_data())
+        self.refresh_dashboard_data()
+
+    def refresh_dashboard_data(self):
+        if not hasattr(self,'dash_tv') or not self.dash_tv.winfo_exists(): return
+        today=datetime.now().strftime('%Y-%m-%d'); selected=self.dash_date.get().strip() or today
+        # Refresh stat cards without rebuilding the filter widgets.
+        for child in self.dash_stats.winfo_children(): child.destroy()
+        vals=[('Sales',self.db.one('SELECT COALESCE(SUM(total),0) x FROM bills WHERE bill_date=?',(selected,))['x'],'#2563eb'),('Bills',self.db.one('SELECT COUNT(*) x FROM bills WHERE bill_date=?',(selected,))['x'],'#7c3aed'),('Customers',self.db.one('SELECT COUNT(*) x FROM customers')['x'],'#0891b2'),('Medicines',self.db.one('SELECT COUNT(*) x FROM medicines')['x'],'#16a34a')]
+        for i,(label,val,accent) in enumerate(vals):
+            c=tk.Frame(self.dash_stats,bg='white',highlightthickness=1,highlightbackground='#e2e8f0'); c.grid(row=0,column=i,sticky='ew',padx=5)
+            tk.Label(c,text=f"{label} — {fmt_date(selected)}",bg='white',fg='#64748b',font=('Segoe UI',9)).pack(anchor='w',padx=15,pady=(12,2))
+            tk.Label(c,text=f'₹{money(val):,.2f}' if label=='Sales' else str(val),bg='white',fg=accent,font=('Segoe UI',19,'bold')).pack(anchor='w',padx=15,pady=(0,11))
+
+        tv=self.dash_tv
+        for x in tv.get_children(): tv.delete(x)
         q=self.dash_search.get().strip().lower(); selected_status=self.dash_status.get()
         rows=[]
         for r in self.db.q('SELECT name,batch,stock,expiry FROM medicines'):
@@ -436,11 +459,6 @@ class App:
         for _,r in sorted(rows,key=lambda x:(x[0],parse_date(x[1]['expiry']) if re.fullmatch(r'\d{4}-\d{2}-\d{2}',x[1]['expiry'] or '') else date.max,x[1]['name'].lower())):
             status,_=expiry_status(r['expiry'],r['stock']);tag={'Near Expiry':'near','Expired':'expired','Low Stock':'low','In Stock':'instock'}[status]
             tv.insert('', 'end',values=(r['name'],r['batch'],r['stock'],fmt_date(r['expiry']),status),tags=(tag,))
-        if not getattr(self,'_dashboard_traces_bound',False):
-            self.dash_date.trace_add('write',lambda *_: self.dashboard_home())
-            self.dash_status.trace_add('write',lambda *_: self.dashboard_home())
-            self.dash_search.trace_add('write',lambda *_: self.dashboard_home())
-            self._dashboard_traces_bound=True
 
     def reset_dashboard_filters(self):
         self.dash_date.set(datetime.now().strftime('%Y-%m-%d'));self.dash_status.set('All');self.dash_search.set('')
