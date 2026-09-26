@@ -1034,6 +1034,34 @@ class App:
         q.trace_add('write',refresh);refresh()
     def sales(self):
         self.title('Sales','Search and filter bills instantly. Export the filtered bills to Excel or double-click a bill to open its PDF.')
+
+        # Quick sales summary cards. These always show the shop's current calendar
+        # week (Monday through today) and current calendar month (1st through today),
+        # independent of the table filters below.
+        today = date.today()
+        week_start = today - timedelta(days=today.weekday())
+        month_start = today.replace(day=1)
+        week_total = self.db.one(
+            'SELECT COALESCE(SUM(total),0) x FROM bills WHERE bill_date>=? AND bill_date<=?',
+            (week_start.isoformat(), today.isoformat())
+        )['x']
+        month_total = self.db.one(
+            'SELECT COALESCE(SUM(total),0) x FROM bills WHERE bill_date>=? AND bill_date<=?',
+            (month_start.isoformat(), today.isoformat())
+        )['x']
+        cards = tk.Frame(self.content,bg='#f8fafc'); cards.pack(fill='x',pady=(0,8))
+        cards.columnconfigure(0,weight=1); cards.columnconfigure(1,weight=1)
+        for col, label, value, accent in [
+            (0, 'Weekly Sales', week_total, '#2563eb'),
+            (1, 'Monthly Sales', month_total, '#7c3aed')
+        ]:
+            card = tk.LabelFrame(cards,text=label,bg='white',fg='#64748b',padx=18,pady=7)
+            card.grid(row=0,column=col,sticky='ew',padx=(0,5) if col==0 else (5,0))
+            amount_label = tk.Label(card,text=f'₹{money(value):,.2f}',bg='white',fg=accent,font=('Segoe UI',18,'bold'))
+            amount_label.pack(anchor='w')
+            if col == 0: self.sales_week_card = amount_label
+            else: self.sales_month_card = amount_label
+
         f=tk.Frame(self.content,bg='#eef2ff',highlightthickness=1,highlightbackground='#c7d2fe',padx=10,pady=9);f.pack(fill='x',pady=(0,8))
         self.sf=tk.StringVar();self.sfrom=tk.StringVar();self.sto=tk.StringVar();self.spay=tk.StringVar(value='All')
         f.columnconfigure(1,weight=1)
@@ -1064,6 +1092,21 @@ class App:
         return self.db.q('SELECT invoice,bill_date,bill_time,customer_name,customer_phone,payment,subtotal,gst,total,sms_status,created_by FROM bills'+((' WHERE '+' AND '.join(where)) if where else '')+' ORDER BY id DESC',args)
     def refresh_sales(self):
         if not hasattr(self,'sales_tv'):return
+        # Keep the quick-summary cards current when a bill is generated while
+        # the Sales page is already open.
+        today = date.today()
+        week_start = today - timedelta(days=today.weekday())
+        month_start = today.replace(day=1)
+        week_total = self.db.one(
+            'SELECT COALESCE(SUM(total),0) x FROM bills WHERE bill_date>=? AND bill_date<=?',
+            (week_start.isoformat(), today.isoformat())
+        )['x']
+        month_total = self.db.one(
+            'SELECT COALESCE(SUM(total),0) x FROM bills WHERE bill_date>=? AND bill_date<=?',
+            (month_start.isoformat(), today.isoformat())
+        )['x']
+        if hasattr(self,'sales_week_card'): self.sales_week_card.config(text=f'₹{money(week_total):,.2f}')
+        if hasattr(self,'sales_month_card'): self.sales_month_card.config(text=f'₹{money(month_total):,.2f}')
         for x in self.sales_tv.get_children():self.sales_tv.delete(x)
         for r in self.sales_rows():self.sales_tv.insert('', 'end',values=(r['invoice'],fmt_date(r['bill_date']),r['bill_time'],r['customer_name'],r['customer_phone'],r['payment'],f"₹{r['subtotal']:.2f}",f"₹{r['gst']:.2f}",f"₹{r['total']:.2f}",r['sms_status'],r['created_by']))
     def export_excel(self):
