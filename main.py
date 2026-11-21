@@ -1,4 +1,9 @@
 import os, re, json, sqlite3, hashlib, secrets, urllib.request, urllib.parse, calendar as calmod, csv, webbrowser, subprocess, sys, shutil, tempfile
+try:
+    from license_client import api_url as license_api_url, check_or_activate as check_license, submit_payment as submit_license_payment, LicenseError
+except Exception:
+    license_api_url=lambda: ''
+    check_license=None; submit_license_payment=None; LicenseError=Exception
 from datetime import datetime, date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import tkinter as tk
@@ -319,7 +324,18 @@ class App:
     def __init__(self):
         self.db=DB(); self.sms=SMS(); self.user=None; self.cart=[]; self.last_invoice=None; self.last_bill_id=None; self.company=self.sms.s.get('company_name',DEFAULT_COMPANY)
         self.last_bill=None; self.root=tk.Tk(); self.root.withdraw(); self.root.title(APP_NAME); self.root.geometry('1180x680'); self.root.minsize(860,580); self.root.protocol('WM_DELETE_WINDOW',self.close)
-        self.setup_style(); self.root.deiconify(); self.login(); self.root.deiconify(); self.root.lift(); self.root.focus_force()
+        self.setup_style(); self.root.deiconify()
+        # Licensing is enforced when a production API URL is configured. An
+        # unconfigured source checkout remains usable for development only.
+        self.license_status=None
+        if license_api_url():
+            try:
+                if check_license is None: raise RuntimeError('Licensing client is unavailable.')
+                self.license_status=check_license()
+            except Exception as ex:
+                messagebox.showerror('MediBill Pro Licence',str(ex)+'\n\nYour local pharmacy data has not been deleted.',parent=self.root)
+                self.db.close(); self.root.destroy(); return
+        self.login(); self.root.deiconify(); self.root.lift(); self.root.focus_force()
     def setup_style(self):
         style=ttk.Style();
         try: style.theme_use('clam')
@@ -423,12 +439,37 @@ class App:
         self.content.bind('<MouseWheel>',lambda e:self.content_canvas.yview_scroll(int(-e.delta/120),'units'))
         tk.Label(side,text='MediBill',bg='#0f172a',fg='white',font=('Segoe UI',21,'bold')).pack(anchor='w',padx=20,pady=(25,2)); tk.Label(side,text=self.company,bg='#0f172a',fg='#94a3b8',font=('Segoe UI',9),wraplength=180).pack(anchor='w',padx=20,pady=(0,15)); tk.Label(side,text=f"{self.user['name']}\n{'Shop Owner' if self.user['role']=='Admin' else self.user['role']}",bg='#1e293b',fg='#e2e8f0',justify='left',anchor='w',padx=12,pady=10).pack(fill='x',padx=12,pady=(0,15))
         items=[('Dashboard','dashboard_home'),('Billing','billing'),('Inventory','inventory'),('Customers','customers'),('Sales','sales'),('Reports','reports'),('SMS Outbox','sms_outbox'),('Activity Log','activity'),('Settings','settings'),('Users & Roles','users'),('My Account','account')]
+        if self.user['role']=='Admin': items.append(('Subscription','subscription'))
         for label,method in items:
             perm={'dashboard_home':'dashboard','sms_outbox':'sms'}.get(method,method)
             if perm not in PERMS.get(self.user['role'],set()): continue
             b=tk.Button(side,text=label,command=getattr(self,method),bg='#0f172a',fg='#cbd5e1',activebackground='#1e40af',activeforeground='white',bd=0,anchor='w',padx=20,pady=10,cursor='hand2',font=('Segoe UI',10,'bold')); b.pack(fill='x',padx=8,pady=2); b.bind('<Enter>',lambda e,b=b:b.configure(bg='#1e293b',fg='white')); b.bind('<Leave>',lambda e,b=b:b.configure(bg='#0f172a',fg='#cbd5e1'))
         self.button(side,'Logout',self.logout,kind='danger').pack(side='bottom',fill='x',padx=18,pady=18)
         self.dashboard_home()
+    def subscription(self):
+        self.title('Subscription & Licence','Lifetime licence and annual maintenance status')
+        status=self.license_status or {}
+        state=status.get('state','Not connected to licensing server')
+        trial_until=datetime.fromtimestamp(status['trial_until']).strftime('%d %b %Y') if status.get('trial_until') else '—'
+        amc_until=datetime.fromtimestamp(status['amc_until']).strftime('%d %b %Y') if status.get('amc_until') else '—'
+        tk.Label(self.content,text=f'Licence status: {state.title()}',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',15,'bold')).pack(anchor='w',pady=5)
+        tk.Label(self.content,text=f"Trial ends: {trial_until}    |    AMC valid until: {amc_until}",bg='#f8fafc',fg='#475569',font=('Segoe UI',10)).pack(anchor='w',pady=5)
+        tk.Label(self.content,text='Lifetime licence: ₹8,000 one-time\nFirst 12 months AMC included\nAMC renewal: ₹2,500 per year\nUPI ID: paramamukherjee943-1@okicici',bg='white',fg='#0f172a',justify='left',font=('Segoe UI',12),padx=18,pady=18,relief='solid',bd=1).pack(anchor='w',fill='x',pady=14)
+        tk.Label(self.content,text='After paying, enter the UTR/reference number below. The owner verifies payment manually; submitting a UTR does not activate the licence automatically.',bg='#f8fafc',fg='#64748b',wraplength=750,justify='left').pack(anchor='w',pady=6)
+        utr=tk.StringVar(); contact=tk.StringVar()
+        tk.Label(self.content,text='UPI UTR / transaction reference',bg='#f8fafc',fg='#334155').pack(anchor='w',pady=(10,3))
+        tk.Entry(self.content,textvariable=utr,width=45,bd=1,relief='solid').pack(anchor='w',ipady=6)
+        tk.Label(self.content,text='Contact number (optional)',bg='#f8fafc',fg='#334155').pack(anchor='w',pady=(10,3))
+        tk.Entry(self.content,textvariable=contact,width=30,bd=1,relief='solid').pack(anchor='w',ipady=6)
+        def submit():
+            if not utr.get().strip(): messagebox.showwarning('Missing UTR','Enter the UPI transaction reference.',parent=self.root); return
+            try:
+                if submit_license_payment is None: raise RuntimeError('Licensing client is not configured.')
+                result=submit_license_payment(utr.get(),contact.get())
+                messagebox.showinfo('Submitted',result.get('message','Payment reference submitted.'),parent=self.root)
+            except Exception as ex: messagebox.showerror('Submission failed',str(ex),parent=self.root)
+        self.button(self.content,'Submit payment reference',submit,kind='success').pack(anchor='w',pady=15)
+
     def logout(self): self.user=None; self.cart=[]; self.login()
     def dashboard_home(self):
         self.title('Dashboard','Live pharmacy overview. Filter the status list by date, status or medicine name.')
@@ -533,7 +574,7 @@ class App:
         self.button(actions,'Clear Bill',self.clear_bill,kind='dark').pack(side='left',padx=3)
         tk.Label(actions,text='Tip: select a row, then use + / − or Delete. Double-click quantity to edit.',bg='#e2e8f0',fg='#64748b').pack(side='right',padx=8)
         foot=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#cbd5e1'); foot.pack(fill='x',pady=(2,0),ipady=5); self.total_lbl=tk.Label(foot,text='Total: ₹0.00',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',20,'bold')); self.total_lbl.pack(side='left',pady=8)
-        self.generate_btn=self.button(foot,'Generate Bill',self.checkout,kind='success'); self.generate_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.sms_btn=self.button(foot,'Send SMS',self.send_last_sms,kind='primary'); self.sms_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.pdf_btn=self.button(foot,'Print',self.generate_last_pdf,kind='dark'); self.pdf_btn.pack(side='right',padx=4,ipadx=8,ipady=5); self.sms_btn.configure(state='disabled'); self.pdf_btn.configure(state='disabled')
+        self.generate_btn=self.button(foot,'Generate Bill',self.checkout,kind='success'); self.generate_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.sms_btn=self.button(foot,'Send SMS',self.send_last_sms,kind='primary'); self.sms_btn.pack(side='right',padx=4,ipadx=14,ipady=5); self.sms_btn.configure(state='disabled')
         self.b_search.trace_add('write',lambda *_:self.bill_search()); search.focus_set()
     def bill_search(self):
         if not hasattr(self,'bill_results'): return
@@ -599,7 +640,7 @@ class App:
         i=self.selected_cart_index()
         if i is not None:self.cart.pop(i);self.refresh_cart()
     def clear_bill(self):
-        self.cart.clear();self.b_name.set('');self.b_phone.set('');self.b_address.set('');self.b_doctor.set('');self.b_doctor_reg.set('');self.refresh_cart();self.last_invoice=None;self.last_bill_id=None;self.sms_btn.configure(state='disabled');self.pdf_btn.configure(state='disabled')
+        self.cart.clear();self.b_name.set('');self.b_phone.set('');self.b_address.set('');self.b_doctor.set('');self.b_doctor_reg.set('');self.refresh_cart();self.last_invoice=None;self.last_bill_id=None;self.sms_btn.configure(state='disabled')
     def refresh_cart(self):
         if not hasattr(self,'cart_tv'):return
         for x in self.cart_tv.get_children():self.cart_tv.delete(x)
@@ -657,8 +698,15 @@ class App:
         self.cart.clear();self.refresh_cart();self.bill_search();
         # Persisted bill/customer data is committed above; refresh Sales immediately so the new sale is visible without reopening the page.
         if hasattr(self,'sales_tv'): self.refresh_sales()
-        self.pdf_btn.configure(state='normal');self.sms_btn.configure(state='normal' if phone else 'disabled');
-        messagebox.showinfo('Bill generated',f'Invoice: {invoice}\nTotal: ₹{total:,.2f}\nCustomer updated automatically: {"Yes" if phone else "No mobile supplied"}\n\nChoose “Print” or “Send SMS” separately.')
+        self.sms_btn.configure(state='normal' if phone else 'disabled')
+        print_note='Bill PDF was not created.'
+        try:
+            pdf_path=self.create_pdf(self.last_bill)
+            if pdf_path:
+                print_note=self.print_pdf(pdf_path)
+        except Exception as print_err:
+            print_note=f'Bill saved, but printing could not be completed: {print_err}'
+        messagebox.showinfo('Bill generated',f'Invoice: {invoice}\nTotal: ₹{total:,.2f}\nCustomer updated automatically: {"Yes" if phone else "No mobile supplied"}\n\n{print_note}')
     def send_last_sms(self):
         if not self.last_bill or not self.last_bill.get('phone'):messagebox.showwarning('SMS','No customer mobile number is available for this bill.');return
         ok,resp=self.sms.send(self.last_bill['phone'],self.sms_message(self.last_bill['invoice'],self.last_bill['name'],self.last_bill['total']),invoice=self.last_bill['invoice'],customer_name=self.last_bill['name'],total=self.last_bill['total']);status='Sent' if ok else 'Queued';self.db.conn.execute('UPDATE bills SET sms_status=? WHERE id=?',(status,self.last_bill_id));self.db.conn.execute('UPDATE sms_outbox SET status=?,provider_response=? WHERE bill_id=?',(status,resp,self.last_bill_id));self.db.audit('SMS',self.last_bill_id,'Send attempted',status,self.user['email']);self.db.conn.commit();messagebox.showinfo('SMS',('SMS sent successfully.' if ok else 'SMS could not be sent; it remains in the local SMS Outbox.')+f'\n\n{resp}')
@@ -711,6 +759,24 @@ class App:
             if os.name=='nt':os.startfile(path)
             else:webbrowser.open('file://'+os.path.abspath(path))
         except Exception:pass
+    def print_pdf(self,path):
+        if not path or not os.path.exists(path):
+            return 'Bill PDF could not be found.'
+        if os.name=='nt':
+            try:
+                os.startfile(path,'print')
+                return 'Bill generated and sent to the default printer.'
+            except Exception as e:
+                try:
+                    self.open_file(path)
+                    return f'Automatic printing was unavailable ({e}). The bill PDF was opened so it can be printed manually.'
+                except Exception:
+                    return f'Automatic printing was unavailable ({e}). PDF saved at: {path}'
+        try:
+            self.open_file(path)
+            return 'Bill PDF generated and opened. Use your system Print command to print it.'
+        except Exception:
+            return f'Bill PDF saved at: {path}'
     def _bind_tree_scroll(self, tree):
         def wheel(e):
             tree.yview_scroll(int(-e.delta/120), 'units')
@@ -724,7 +790,7 @@ class App:
         top=tk.Frame(self.content,bg='#f8fafc');top.pack(fill='x',pady=(0,10))
         self.button(top,'Bulk Import Excel / CSV',self.bulk_import,kind='primary').pack(side='left')
         self.button(top,'Import Image / PDF',self.import_medicine_document,kind='primary').pack(side='left',padx=7)
-        self.button(top,'Print',self.print_inventory_pdf,kind='dark').pack(side='left',padx=7)
+        self.button(top,'Export Excel',self.export_inventory_excel,kind='success').pack(side='left',padx=7); self.button(top,'Print',self.print_inventory_pdf,kind='dark').pack(side='left',padx=7)
         tk.Label(top,text='Expected: Name, Molecule, Batch, Expiry, MRP, Selling Price, Cost, Stock, GST %, Supplier',bg='#f8fafc',fg='#64748b').pack(side='left',padx=12)
         form=tk.Frame(self.content,bg='white',highlightthickness=1,highlightbackground='#e2e8f0',padx=14,pady=12);form.pack(fill='x')
         vars=[tk.StringVar() for _ in range(10)]
@@ -759,7 +825,7 @@ class App:
             except Exception as e:messagebox.showerror('Inventory','Please check the medicine fields.\n\n'+str(e))
         self.button(form,'+ Add Medicine',add,kind='success').grid(row=4,column=0,columnspan=5,padx=7,pady=(4,2),sticky='w')
         tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True,pady=10)
-        tv=ttk.Treeview(tvbox,columns=('id','name','molecule','batch','expiry','mrp','price','stock','gst','supplier','saved_by'),show='headings',selectmode='extended');tv.pack(side='left',fill='both',expand=True)
+        self.inventory_tv=ttk.Treeview(tvbox,columns=('id','name','molecule','batch','expiry','mrp','price','stock','gst','supplier','saved_by'),show='headings',selectmode='extended');tv=self.inventory_tv;tv.pack(side='left',fill='both',expand=True)
         vsb=AutoScrollbar(tvbox,orient='vertical',command=tv.yview);vsb.pack(side='right',fill='y');tv.configure(yscrollcommand=vsb.set); self._bind_tree_scroll(tv)
         for c,h in [('id','ID'),('name','Medicine'),('molecule','Molecule'),('batch','Batch'),('expiry','Expiry'),('mrp','MRP'),('price','Selling Price'),('stock','Stock'),('gst','GST %'),('supplier','Supplier'),('saved_by','Saved / Updated By')]:tv.heading(c,text=h)
         inv_widths={'id':45,'name':150,'molecule':125,'batch':90,'expiry':90,'mrp':75,'price':90,'stock':65,'gst':60,'supplier':120,'saved_by':135}
@@ -1024,7 +1090,7 @@ class App:
             messagebox.showerror('Bulk import failed',str(e))
     def customers(self):
         self.title('Customers','Every completed bill with a mobile number automatically saves or updates the customer.')
-        f=tk.Frame(self.content,bg='#f8fafc');f.pack(fill='x',pady=(0,8));q=tk.StringVar();ent=tk.Entry(f,textvariable=q,width=45,bd=1,relief='solid');ent.pack(side='left',ipady=6);tk.Label(f,text='  Instant search',bg='#f8fafc',fg='#64748b').pack(side='left')
+        f=tk.Frame(self.content,bg='#f8fafc');f.pack(fill='x',pady=(0,8));q=tk.StringVar();self.customer_search=q;ent=tk.Entry(f,textvariable=q,width=45,bd=1,relief='solid');ent.pack(side='left',ipady=6);tk.Label(f,text='  Instant search',bg='#f8fafc',fg='#64748b').pack(side='left');self.button(f,'Export Excel',self.export_customers_excel,kind='success').pack(side='left',padx=10)
         tvbox=tk.Frame(self.content,bg='white');tvbox.pack(fill='both',expand=True);tv=ttk.Treeview(tvbox,columns=('name','phone','email','credit','total','last','saved_by'),show='headings');tv.pack(side='left',fill='both',expand=True);tv_sb=AutoScrollbar(tvbox,orient='vertical',command=tv.yview);tv_sb.pack(side='right',fill='y');tv.configure(yscrollcommand=tv_sb.set); self._bind_tree_scroll(tv)
         for c,h in [('name','Name'),('phone','Mobile'),('email','Email'),('credit','Credit'),('total','Total Purchase'),('last','Last Purchase'),('saved_by','Saved / Updated By')]:tv.heading(c,text=h)
         def refresh(*_):
@@ -1109,6 +1175,38 @@ class App:
         if hasattr(self,'sales_month_card'): self.sales_month_card.config(text=f'₹{money(month_total):,.2f}')
         for x in self.sales_tv.get_children():self.sales_tv.delete(x)
         for r in self.sales_rows():self.sales_tv.insert('', 'end',values=(r['invoice'],fmt_date(r['bill_date']),r['bill_time'],r['customer_name'],r['customer_phone'],r['payment'],f"₹{r['subtotal']:.2f}",f"₹{r['gst']:.2f}",f"₹{r['total']:.2f}",r['sms_status'],r['created_by']))
+    def export_inventory_excel(self):
+        if Workbook is None:
+            messagebox.showerror('Excel','Excel support is unavailable.')
+            return
+        rows=self.db.q("SELECT name,molecule,batch,expiry,mrp,price,cost,stock,gst,supplier,COALESCE(NULLIF(updated_by,''),NULLIF(created_by,''),'Legacy/System') AS saved_by FROM medicines ORDER BY name")
+        path=filedialog.asksaveasfilename(defaultextension='.xlsx',initialfile=f'MediBill_Inventory_{datetime.now():%Y%m%d_%H%M%S}.xlsx',filetypes=[('Excel','*.xlsx')])
+        if not path:return
+        wb=Workbook();ws=wb.active;ws.title='Inventory'
+        ws.append(['Medicine','Molecule','Batch','Expiry','MRP','Selling Price','Cost','Stock','GST %','Supplier','Saved / Updated By'])
+        for r in rows:ws.append([r['name'],r['molecule'],r['batch'],r['expiry'],r['mrp'],r['price'],r['cost'],r['stock'],r['gst'],r['supplier'],r['saved_by']])
+        ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
+        for col in ws.columns:
+            letter=col[0].column_letter;ws.column_dimensions[letter].width=min(30,max(12,max(len(str(c.value or '')) for c in col)+2))
+        wb.save(path);messagebox.showinfo('Excel',f'Exported {len(rows)} inventory entries.')
+
+    def export_customers_excel(self):
+        if Workbook is None:
+            messagebox.showerror('Excel','Excel support is unavailable.')
+            return
+        q=getattr(self,'customer_search',None);term=q.get().strip() if q else ''
+        like=f'%{term}%'
+        rows=self.db.q("SELECT name,phone,email,address,credit,total_purchase,last_purchase,COALESCE(NULLIF(updated_by,''),NULLIF(created_by,''),'Legacy/System') AS saved_by FROM customers WHERE name LIKE ? OR phone LIKE ? ORDER BY last_purchase DESC",(like,like))
+        path=filedialog.asksaveasfilename(defaultextension='.xlsx',initialfile=f'MediBill_Customers_{datetime.now():%Y%m%d_%H%M%S}.xlsx',filetypes=[('Excel','*.xlsx')])
+        if not path:return
+        wb=Workbook();ws=wb.active;ws.title='Customers'
+        ws.append(['Name','Mobile','Email','Address','Credit','Total Purchase','Last Purchase','Saved / Updated By'])
+        for r in rows:ws.append(list(r))
+        ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
+        for col in ws.columns:
+            letter=col[0].column_letter;ws.column_dimensions[letter].width=min(40,max(12,max(len(str(c.value or '')) for c in col)+2))
+        wb.save(path);messagebox.showinfo('Excel',f'Exported {len(rows)} customers.')
+
     def export_excel(self):
         if Workbook is None:messagebox.showerror('Excel','Excel support is unavailable.');return
         rows=self.sales_rows();path=filedialog.asksaveasfilename(defaultextension='.xlsx',initialfile=f'MediBill_Bills_{datetime.now():%Y%m%d_%H%M%S}.xlsx',filetypes=[('Excel','*.xlsx')]);
@@ -1147,7 +1245,7 @@ class App:
         tk.Entry(f,textvariable=self.rmaxprice,width=10,bd=1,relief='solid').grid(row=1,column=5,sticky='w',padx=(0,8),ipady=5,pady=3)
         self.button(f,'Reset Filters',self.reset_reports,kind='dark').grid(row=1,column=6,sticky='w',padx=4,pady=3)
         for v in [self.rf,self.rfrom,self.rto,self.rpay,self.rminprice,self.rmaxprice]:v.trace_add('write',lambda *_:self.refresh_reports())
-        report_actions=tk.Frame(self.content,bg='#f8fafc');report_actions.pack(fill='x',pady=(0,8)); self.button(report_actions,'Print',self.print_report_pdf,kind='dark').pack(side='left'); self.report_cards=tk.Frame(self.content,bg='#f8fafc');self.report_cards.pack(fill='x')
+        report_actions=tk.Frame(self.content,bg='#f8fafc');report_actions.pack(fill='x',pady=(0,8)); self.button(report_actions,'Export Excel',self.export_report_excel,kind='success').pack(side='left',padx=(0,6)); self.button(report_actions,'Print',self.print_report_pdf,kind='dark').pack(side='left'); self.report_cards=tk.Frame(self.content,bg='#f8fafc');self.report_cards.pack(fill='x')
         tk.Label(self.content,text='Top Medicines by Quantity Sold',bg='#f8fafc',fg='#0f172a',font=('Segoe UI',14,'bold')).pack(anchor='w',pady=(18,8))
         rbox=tk.Frame(self.content,bg='white');rbox.pack(fill='both',expand=True)
         self.report_tv=ttk.Treeview(rbox,columns=('medicine','qty','sales'),show='headings');self.report_tv.pack(side='left',fill='both',expand=True)
@@ -1243,6 +1341,31 @@ class App:
             path=self._simple_pdf(f'Report-{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pdf','Sales Summary Report',['Medicine','Units Sold','Sales Value'],data,[f'Filtered sales: ₹{float(total):.2f}',f'Top medicine rows: {len(data)}'])
             if messagebox.askyesno('PDF ready',f'Report PDF saved as:\n{path}\n\nOpen it now?'):self.open_file(path)
         except Exception as e:messagebox.showerror('PDF','Could not create report PDF: '+str(e))
+
+    def export_report_excel(self):
+        if Workbook is None:
+            messagebox.showerror('Excel','Excel support is unavailable.')
+            return
+        try:
+            where,args,clause=self.report_rows()
+        except ValueError as e:
+            messagebox.showerror('Report filter',str(e));return
+        bills=self.db.q('SELECT invoice,bill_date,bill_time,customer_name,customer_phone,payment,subtotal,gst,total,sms_status,created_by FROM bills'+clause+' ORDER BY id DESC',args)
+        top_sql='SELECT i.name,SUM(i.qty) qty,SUM(i.amount) sales FROM bill_items i JOIN bills b ON b.id=i.bill_id'
+        if where:top_sql+=' WHERE '+' AND '.join(where)
+        top_sql+=' GROUP BY i.name ORDER BY qty DESC LIMIT 50'
+        top=self.db.q(top_sql,args)
+        path=filedialog.asksaveasfilename(defaultextension='.xlsx',initialfile=f'MediBill_Report_{datetime.now():%Y%m%d_%H%M%S}.xlsx',filetypes=[('Excel','*.xlsx')])
+        if not path:return
+        wb=Workbook();ws=wb.active;ws.title='Filtered Bills';ws.append(['Invoice','Date','Time','Customer','Mobile','Payment','Taxable','GST','Total','SMS Status','Saved By'])
+        for r in bills:ws.append(list(r))
+        wt=wb.create_sheet('Top Medicines');wt.append(['Medicine','Units Sold','Sales Value'])
+        for r in top:wt.append([r['name'],r['qty'],r['sales']])
+        for wsx in wb.worksheets:
+            wsx.freeze_panes='A2';wsx.auto_filter.ref=wsx.dimensions
+            for col in wsx.columns:
+                letter=col[0].column_letter;wsx.column_dimensions[letter].width=min(35,max(12,max(len(str(c.value or '')) for c in col)+2))
+        wb.save(path);messagebox.showinfo('Excel',f'Exported {len(bills)} filtered bills and {len(top)} top-medicine rows.')
 
     def reset_reports(self):
         self.rf.set('');self.rfrom.set('');self.rto.set('');self.rpay.set('All');self.rminprice.set('');self.rmaxprice.set('')
