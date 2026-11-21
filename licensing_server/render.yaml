@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: medibill-pro-licensing
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r licensing_server/requirements.txt
+    startCommand: uvicorn licensing_server.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: MEDIBILL_OWNER_KEY
+        sync: false
+      - key: MEDIBILL_SIGNING_KEY
+        sync: false
+      - key: MEDIBILL_LICENSE_DB
+        value: /var/data/licenses.db
+    disk:
+      name: licensing-data
+      mountPath: /var/data
+      sizeGB: 1
