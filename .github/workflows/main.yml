@@ -1,43 +1,76 @@
 name: Build MediBill Windows EXE
+
 on:
   workflow_dispatch:
   push:
     branches: ["main"]
+
 permissions:
   contents: read
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install Python dependencies
         shell: cmd
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
-      - name: Download bundled OCR engine
+
+      - name: Install Tesseract OCR
         shell: powershell
         run: |
-          $url = "https://github.com/tesseract-ocr/tesseract/releases/download/5.5.3/tesseract-ocr-w64-setup-5.5.3.20260724.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\tesseract.exe"
-          $dest = "$pwd\tessbundle"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          Start-Process -FilePath "$env:RUNNER_TEMP\tesseract.exe" -ArgumentList "/S", "/D=$dest" -Wait -NoNewWindow
-          if (!(Test-Path "$dest\tesseract.exe")) { throw "Tesseract bundle was not installed." }
-      - name: Build
+          choco install tesseract --no-progress -y
+          if (!(Test-Path "C:\Program Files\Tesseract-OCR\tesseract.exe")) {
+            throw "Tesseract installation was not found."
+          }
+          New-Item -ItemType Directory -Force -Path "tesseract" | Out-Null
+          Copy-Item "C:\Program Files\Tesseract-OCR\*" "tesseract" -Recurse -Force
+          if (!(Test-Path "tesseract\tesseract.exe")) { throw "Tesseract executable was not copied." }
+
+      - name: Validate production licensing configuration
+        shell: powershell
+        run: |
+          if (!(Test-Path "license_config.json")) { throw "Create license_config.json with your deployed HTTPS licensing API URL before releasing." }
+          $cfg = Get-Content "license_config.json" -Raw | ConvertFrom-Json
+          if (!$cfg.api_url -or !$cfg.api_url.StartsWith("https://")) { throw "license_config.json must contain a real HTTPS api_url." }
+          if ((Select-String -Path "license_client.py" -Pattern "REPLACE_WITH_SERVER_PUBLIC_KEY_B64" -Quiet)) { throw "Insert the generated server public key in license_client.py before building." }
+
+      - name: Build MediBill.exe
         shell: cmd
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MediBill --add-data "tessbundle;tesseract" main.py
-      - name: Verify
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name MediBill main.py --hidden-import cryptography.hazmat.primitives.asymmetric.ed25519 ^
+            --add-binary "tesseract\*.exe;tesseract" ^
+            --add-binary "tesseract\*.dll;tesseract" ^
+            --add-data "tesseract\tessdata;tesseract\tessdata"
+
+      - name: Include licensing configuration when supplied
+        shell: powershell
+        run: |
+          if (Test-Path "license_config.json") { Copy-Item "license_config.json" "dist\license_config.json" -Force }
+          Copy-Item "license_client.py" "dist\license_client.py" -Force
+
+      - name: Verify EXE
         shell: powershell
         run: |
           if (!(Test-Path "dist\MediBill.exe")) { throw "MediBill.exe was not created." }
-      - name: Upload
+          $size = (Get-Item "dist\MediBill.exe").Length
+          if ($size -lt 1000000) { throw "MediBill.exe looks unexpectedly small ($size bytes)." }
+          Write-Host "MediBill.exe created: $size bytes"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: MediBill-Windows-EXE
-          path: dist/MediBill.exe
+          path: |
+            dist/MediBill.exe
+            dist/license_config.json
           if-no-files-found: error
